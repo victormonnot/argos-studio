@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>ARGOS Studio — Sessions</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script type="module" src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="workspace">
+      <aside class="sidebar" aria-label="Sessions enregistrées">
+        <a class="brand" href="/" aria-label="ARGOS Studio, accueil"
+          ><span class="brand-mark" aria-hidden="true">A<span>·</span></span
+          ><span>ARGOS <strong>STUDIO</strong></span></a
+        >
+        <div class="sidebar-title">
+          <h2>Sessions</h2>
+          <span id="session-count" class="count">0</span>
+        </div>
+        <p class="sidebar-description">Un essai, ses mesures, ses preuves.</p>
+        <nav
+          id="session-list"
+          class="session-list"
+          aria-label="Choisir une session"
+        >
+          <p class="muted">Chargement…</p>
+        </nav>
+        <details class="import-panel">
+          <summary>Importer un enregistrement</summary>
+          <p id="import-status">Vérification de l’adaptateur ARGOS…</p>
+          <label class="file-label" for="import-file"
+            >Enregistrement ARGOS (.jsonl)</label
+          >
+          <input id="import-file" type="file" accept=".jsonl" disabled />
+          <p class="muted small">
+            Le fichier source reste inchangé. L’import crée une session de
+            rejeu.
+          </p>
+        </details>
+        <div class="sidebar-footer">
+          <span class="status-dot"></span><span>Atelier local</span
+          ><span id="version"></span>
+        </div>
+      </aside>
+      <main>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">ACQUISITION · ANALYSE · REJEU</p>
+            <h1>Le banc de travail.</h1>
+            <p class="page-description">
+              Observer un signal, marquer un essai, retrouver ce qui s’est
+              passé.
+            </p>
+          </div>
+          <span class="local-badge">LOCAL</span>
+        </header>
+        <div id="error-message" class="notice error" role="alert" hidden></div>
+        <div
+          id="success-message"
+          class="notice success"
+          role="status"
+          hidden
+        ></div>
+        <section class="start-panel" aria-labelledby="start-title">
+          <div class="start-description">
+            <h2 id="start-title">Nouvelle session</h2>
+            <p>Source synthétique · un véhicule · 3 min maximum</p>
+          </div>
+          <form id="start-form" class="start-form">
+            <label
+              >Nom<input
+                id="session-name"
+                name="name"
+                maxlength="100"
+                placeholder="Essai de réception"
+                required
+            /></label>
+            <label class="objective-input"
+              >Objectif<input
+                id="session-objective"
+                name="objective"
+                maxlength="500"
+                placeholder="Observer une interruption du flux"
+                required
+            /></label>
+            <button id="start-button" type="submit" class="button primary">
+              <span aria-hidden="true">＋</span> Démarrer
+            </button>
+          </form>
+        </section>
+        <section id="empty-state" class="empty-state" hidden>
+          <div class="empty-graphic" aria-hidden="true">⌁</div>
+          <h2>Une première mesure change tout.</h2>
+          <p>
+            Démarrez une session synthétique. Le flux est enregistré au fil de
+            l’essai ; vous pourrez l’annoter, provoquer une interruption et
+            consulter ses traces après l’arrêt.
+          </p>
+          <p class="muted">
+            Aucun matériel connecté. Aucun modèle de langage actif.
+          </p>
+        </section>
+        <section
+          id="session-workspace"
+          aria-labelledby="active-session-title"
+          hidden
+        >
+          <div class="session-heading">
+            <div>
+              <div class="session-kicker">
+                <span id="source-badge" class="source-badge"></span
+                ><span id="session-status" class="session-state"></span>
+              </div>
+              <h2 id="active-session-title"></h2>
+              <p id="active-objective" class="muted"></p>
+            </div>
+            <div class="session-actions">
+              <button id="export-button" class="button subtle" type="button">
+                Exporter</button
+              ><button id="stop-button" class="button danger" type="button">
+                Arrêter la session
+              </button>
+            </div>
+          </div>
+          <div class="source-notice" id="source-notice"></div>
+          <div class="work-grid">
+            <div class="measurement-column">
+              <section
+                class="panel signal-panel"
+                aria-labelledby="signal-title"
+              >
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">TÉLÉMÉTRIE</p>
+                    <h3 id="signal-title">Attitude observée</h3>
+                  </div>
+                  <div id="freshness" class="freshness">
+                    <span class="status-dot"></span
+                    ><span id="freshness-text">En attente</span>
+                  </div>
+                </div>
+                <p id="measurement-context" class="measurement-context">
+                  Aucune mesure
+                </p>
+                <div class="metrics">
+                  <div>
+                    <span class="metric-label">Roulis</span
+                    ><strong id="roll-value">—</strong
+                    ><span class="metric-unit">degrés</span>
+                  </div>
+                  <div>
+                    <span class="metric-label">Tangage</span
+                    ><strong id="pitch-value">—</strong
+                    ><span class="metric-unit">degrés</span>
+                  </div>
+                  <div>
+                    <span class="metric-label">Vitesse gyro X</span
+                    ><strong id="gyro-value">—</strong
+                    ><span class="metric-unit">°/s</span>
+                  </div>
+                  <div>
+                    <span class="metric-label">Échantillons</span
+                    ><strong id="sample-value">0</strong
+                    ><span id="sample-scope" class="metric-unit"
+                      >dans la fenêtre</span
+                    >
+                  </div>
+                </div>
+                <div class="chart-legend">
+                  <span><i class="legend-line roll"></i>Roulis</span
+                  ><span><i class="legend-line pitch"></i>Tangage</span
+                  ><span id="chart-clock" class="chart-clock"
+                    >Temps écoulé (s)</span
+                  >
+                </div>
+                <div class="chart-container">
+                  <svg
+                    id="signal-chart"
+                    viewBox="0 0 900 270"
+                    role="img"
+                    aria-label="Roulis et tangage au cours du temps"
+                  ></svg>
+                  <p id="chart-empty" class="chart-empty" hidden>
+                    Aucune mesure dans cette fenêtre.
+                  </p>
+                </div>
+                <div class="replay-controls">
+                  <button
+                    id="play-button"
+                    class="button compact subtle"
+                    type="button"
+                    aria-label="Lire les mesures enregistrées"
+                  >
+                    Lire</button
+                  ><label class="cursor-label" for="replay-cursor"
+                    >Curseur</label
+                  ><input
+                    id="replay-cursor"
+                    type="range"
+                    min="0"
+                    max="0"
+                    step="1"
+                    value="0"
+                    aria-label="Position dans les mesures"
+                  /><output id="cursor-value" for="replay-cursor">—</output
+                  ><button
+                    id="live-button"
+                    class="button compact subtle"
+                    type="button"
+                  >
+                    Dernière mesure
+                  </button>
+                </div>
+                <div class="window-controls">
+                  <form id="window-form">
+                    <span class="window-label">Fenêtre</span
+                    ><label
+                      >De<input
+                        id="window-start"
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        placeholder="0"
+                      /><span>s</span></label
+                    ><label
+                      >à<input
+                        id="window-end"
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        placeholder="fin"
+                      /><span>s</span></label
+                    ><button class="button compact subtle" type="submit">
+                      Appliquer</button
+                    ><button
+                      id="reset-window"
+                      class="text-button"
+                      type="button"
+                    >
+                      Tout voir
+                    </button>
+                  </form>
+                </div>
+                <p id="inspected-record" class="record-reference">
+                  Sélectionnez un point du graphique ou déplacez le curseur.
+                </p>
+              </section>
+              <section
+                class="panel timeline-panel"
+                aria-labelledby="timeline-title"
+              >
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">CONTEXTE DE L’ESSAI</p>
+                    <h3 id="timeline-title">Repères & observations</h3>
+                  </div>
+                  <span id="event-count" class="count">0</span>
+                </div>
+                <form id="annotation-form" class="annotation-form">
+                  <label class="visually-hidden" for="annotation-text"
+                    >Observation</label
+                  ><input
+                    id="annotation-text"
+                    maxlength="1000"
+                    placeholder="Ce que vous observez à cet instant…"
+                    required
+                  /><button class="button subtle" type="submit">Marquer</button>
+                </form>
+                <p id="annotation-time" class="small muted">
+                  Le repère sera attaché à la dernière mesure.
+                </p>
+                <ol id="event-list" class="event-list"></ol>
+              </section>
+            </div>
+            <aside class="evidence-column" aria-label="Analyse et preuves">
+              <section class="panel analysis-panel">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">ANALYSE DE LA FENÊTRE</p>
+                    <h3>Continuité du flux</h3>
+                  </div>
+                  <span class="analysis-mark" aria-hidden="true">⌁</span>
+                </div>
+                <p id="analysis-conclusion" class="analysis-conclusion">
+                  Les mesures arrivent…
+                </p>
+                <dl class="analysis-stats">
+                  <div>
+                    <dt>Intervalle médian</dt>
+                    <dd id="median-interval">—</dd>
+                  </div>
+                  <div>
+                    <dt>Intervalle maximal</dt>
+                    <dd id="maximum-gap">—</dd>
+                  </div>
+                  <div>
+                    <dt>Durée observée</dt>
+                    <dd id="observed-duration">—</dd>
+                  </div>
+                </dl>
+                <div id="gap-list" class="gap-list"></div>
+                <p class="evidence-caption">
+                  Chaque intervalle renvoie aux échantillons qui l’encadrent,
+                  parfois hors de la fenêtre sélectionnée.
+                </p>
+                <details class="analysis-limits">
+                  <summary>Limites de l’analyse</summary>
+                  <ul id="analysis-limitations"></ul>
+                </details>
+              </section>
+              <section class="panel experiment-panel">
+                <p class="eyebrow">ESSAI CONTRÔLÉ</p>
+                <h3>Interrompre la réception</h3>
+                <p>
+                  Couper le flux synthétique pendant 2 secondes, puis vérifier
+                  l’intervalle dans les mesures conservées.
+                </p>
+                <button
+                  id="dropout-button"
+                  class="button subtle full-width"
+                  type="button"
+                >
+                  Provoquer une interruption de 2 s
+                </button>
+                <p class="small muted">
+                  Action réservée à la source synthétique active. Aucun ordre
+                  envoyé à un véhicule.
+                </p>
+              </section>
+              <details class="panel provenance-panel">
+                <summary>Provenance de la session</summary>
+                <dl>
+                  <dt>Identifiant</dt>
+                  <dd id="provenance-id"></dd>
+                  <dt>Créée le</dt>
+                  <dd id="provenance-created"></dd>
+                  <dt>Source</dt>
+                  <dd id="provenance-source"></dd>
+                </dl>
+                <pre id="provenance-metadata"></pre>
+              </details>
+            </aside>
+          </div>
+          <footer class="workspace-footer">
+            <span
+              >Données persistées localement · horloges de source et de
+              réception distinctes</span
+            ><span id="footer-status">ARGOS Studio</span>
+          </footer>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
