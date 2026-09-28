@@ -5,8 +5,11 @@ import os
 
 import uvicorn
 
+from .config import load_environment
+
 
 def main() -> None:
+    load_environment()
     parser = argparse.ArgumentParser(description="Run the local ARGOS Studio workspace.")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", default=os.environ.get("ARGOS_STUDIO_DATA_DIR", ".data"))

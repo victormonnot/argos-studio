@@ -154,19 +154,26 @@ synthetic protocol.
 ## Connect an investigation agent
 
 The agent is disabled by default. Configure the OpenAI adapter and an explicit
-model supporting Responses function calling before starting Studio:
+model supporting Responses function calling before starting Studio. From the
+checkout, create a local configuration file:
 
 ```sh
-export ARGOS_STUDIO_AGENT_PROVIDER=openai
-export ARGOS_STUDIO_AGENT_MODEL=YOUR_MODEL_ID
-read -rs -p 'OpenAI API key: ' OPENAI_API_KEY
-export OPENAI_API_KEY
-.venv/bin/argos-studio
+cp -n .env.example .env
+chmod 600 .env
 ```
 
-The `read` example uses Bash and keeps the key out of shell history. Credentials
-are read from the server environment, never from the browser or database.
-Studio does not load `.env` files. Missing configuration leaves all recording,
+Edit `.env` locally to fill `ARGOS_STUDIO_AGENT_MODEL` and `OPENAI_API_KEY`, then
+run `.venv/bin/argos-studio`. The `.env` file is ignored by Git; `.env.example`
+contains only public placeholders. Credentials stay on the server, outside the
+browser and database.
+
+At startup, Studio uses [python-dotenv](https://github.com/theskumar/python-dotenv)
+to load only `.env` in the launch directory; it does not search parent directories.
+Existing process variables take precedence, including explicitly empty values.
+The command-line `--data-dir` option takes precedence over both. Values are not
+expanded as shell commands or interpolated from other variables. Restart Studio
+after editing the file. Supplying an explicit `Settings` object to `create_app`
+bypasses file loading, including in tests. Missing configuration leaves all recording,
 investigation and synthetic experiment functions usable. An available adapter
 means configuration is present, not that credentials or model access have been
 validated; provider errors appear on the corresponding request.

@@ -20,6 +20,7 @@ from .acquisition import Acquisition
 from .agent import AgentLimits, AgentRunner
 from .agent_provider import AgentConfig, OpenAIProvider, Provider, ProviderError
 from .argos_import import read_argos_recording
+from .config import load_environment
 from .core import MAX_EXPERIMENTS, MAX_INVESTIGATIONS, Store
 from .experiments import PROPOSAL_TTL_S, ExperimentRunner, SyntheticProtocol
 from .investigation import ALGORITHM_VERSION, investigate
@@ -103,7 +104,9 @@ Bound = Annotated[float | None, Query(ge=0, allow_inf_nan=False)]
 def create_app(
     settings: Settings | None = None, *, agent_provider: Provider | None = None
 ) -> FastAPI:
-    settings = settings or Settings()
+    if settings is None:
+        load_environment()
+        settings = Settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
