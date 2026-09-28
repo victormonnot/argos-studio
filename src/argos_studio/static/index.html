@@ -64,6 +64,29 @@
           hidden
         ></div>
         <section
+          id="active-agent"
+          class="active-experiment"
+          aria-label="Investigation de l’agent en cours"
+          hidden
+        >
+          <div>
+            <p class="eyebrow">AGENT EN COURS</p>
+            <p id="active-agent-state" role="status"></p>
+          </div>
+          <div class="experiment-actions">
+            <button id="active-agent-open" class="button subtle" type="button">
+              Voir l’investigation
+            </button>
+            <button
+              id="active-agent-cancel"
+              class="button danger"
+              type="button"
+            >
+              Annuler l’agent
+            </button>
+          </div>
+        </section>
+        <section
           id="active-experiment"
           class="active-experiment"
           aria-label="Expérience en cours"
@@ -198,7 +221,8 @@
             annoter et retrouver leurs traces après l’arrêt.
           </p>
           <p class="muted">
-            Réception passive uniquement. Aucun modèle de langage actif.
+            Réception passive uniquement. L’analyse des mesures reste disponible
+            sans agent.
           </p>
         </section>
         <section
@@ -518,6 +542,112 @@
               </details>
             </aside>
           </div>
+          <section class="panel agent-panel" aria-labelledby="agent-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">QUESTION · OUTILS · PREUVES</p>
+                <h3 id="agent-title">Investiguer avec l’agent</h3>
+              </div>
+              <span id="agent-provider" class="investigation-method"
+                >Fournisseur non configuré</span
+              >
+            </div>
+            <div class="agent-introduction">
+              <p id="agent-availability" class="small muted" role="status">
+                Vérification de la configuration…
+              </p>
+              <p id="agent-disclosure" class="small muted"></p>
+              <p class="small muted">
+                L’agent peut consulter les mesures, enregistrer une
+                investigation et préparer un essai synthétique. Le lancement de
+                cet essai reste une action explicite dans le protocole.
+              </p>
+            </div>
+            <form id="agent-form" class="investigation-form">
+              <label for="agent-prompt"
+                >Question sur cette session
+                <span>4 000 caractères maximum</span></label
+              >
+              <textarea
+                id="agent-prompt"
+                rows="3"
+                maxlength="4000"
+                required
+                placeholder="Examine cette interruption et les preuves disponibles. Que peut-on conclure et quelle vérification proposer ?"
+              ></textarea>
+              <p id="agent-window" class="small muted"></p>
+              <div class="agent-submit-row">
+                <button
+                  id="agent-submit"
+                  class="button primary"
+                  type="submit"
+                  disabled
+                >
+                  Demander à l’agent</button
+                ><span id="agent-limits" class="small muted"></span>
+              </div>
+            </form>
+            <div class="experiment-history-row">
+              <label for="agent-history"
+                >Investigations de l’agent enregistrées<select
+                  id="agent-history"
+                  disabled
+                >
+                  <option value="">Aucune investigation de l’agent</option>
+                </select></label
+              >
+              <button
+                id="agent-export"
+                class="button subtle"
+                type="button"
+                disabled
+              >
+                Exporter la trace
+              </button>
+            </div>
+            <p id="agent-status" class="investigation-status" role="status">
+              Aucune investigation de l’agent pour cette session.
+            </p>
+            <article id="agent-detail" class="agent-detail" hidden>
+              <div class="report-heading">
+                <div>
+                  <p id="agent-run-state" class="eyebrow"></p>
+                  <h4 id="agent-run-meta"></h4>
+                </div>
+                <button
+                  id="agent-cancel"
+                  class="button danger"
+                  type="button"
+                  hidden
+                >
+                  Annuler l’agent
+                </button>
+              </div>
+              <p id="agent-run-window" class="small muted"></p>
+              <blockquote
+                id="agent-run-prompt"
+                class="agent-prompt"
+              ></blockquote>
+              <p id="agent-run-error" class="notice error" hidden></p>
+              <p id="agent-answer-note" class="small muted">
+                Réponse du modèle : vérifiez les constats avec les résultats des
+                outils et les mesures liées.
+              </p>
+              <div id="agent-answer" class="agent-answer"></div>
+              <div
+                id="agent-evidence"
+                class="agent-evidence"
+                aria-label="Preuves consultées par l’agent"
+              ></div>
+              <details class="agent-trace">
+                <summary id="agent-trace-summary">
+                  Outils et consommation
+                </summary>
+                <ol id="agent-steps"></ol>
+                <pre id="agent-usage" class="evidence-data"></pre>
+              </details>
+            </article>
+          </section>
           <section
             class="panel investigation-panel"
             aria-labelledby="investigation-title"

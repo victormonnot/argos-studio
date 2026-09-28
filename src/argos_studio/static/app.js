@@ -1,3 +1,5 @@
+import { initAgent } from "./agent.js";
+
 const $ = (id) => document.getElementById(id);
 const state = {
   sessions: [],
@@ -276,6 +278,7 @@ async function selectSession(id) {
   await Promise.all([
     refreshSelection(),
     loadInvestigations(id, state.investigationSessionRevision, true),
+    agentWorkspace.selectionChanged(),
   ]);
 }
 async function refreshSelection() {
@@ -341,7 +344,7 @@ function renderSession() {
   text(
     "source-notice",
     simulated
-      ? "Signal synthétique de développement ; aucune physique d’autopilote simulée. Aucun matériel connecté, aucun modèle de langage actif."
+      ? "Signal synthétique de développement ; aucune physique d’autopilote simulée. Aucun matériel connecté."
       : mavlink
         ? "Réception MAVLink passive locale. Origine déclarée : simulation SITL, non authentifiée ; une adresse locale ne la prouve pas. Aucun ordre envoyé au véhicule. Les datagrammes bruts sont conservés."
         : `Rejeu d’un fichier ARGOS. Origine déclarée : ${session.metadata?.environment === "simulation" ? "simulation" : session.metadata?.environment === "real" ? "matériel (déclaré)" : "non établie"}. Aucun flux matériel actif ; les horloges originales restent distinctes.`,
@@ -366,6 +369,7 @@ function renderSession() {
   renderEvents(events);
   renderAnalysis();
   renderControls();
+  agentWorkspace.sync();
 }
 function formatDate(value) {
   if (value === null || value === undefined) return "—";
@@ -946,6 +950,23 @@ $("import-file").addEventListener("change", () =>
     }
   }),
 );
+const agentWorkspace = initAgent({
+  getState: () => state,
+  api,
+  post,
+  element,
+  formatDate,
+  seconds,
+  selectSession,
+  setWindow,
+  selectInvestigation,
+  refreshExperiments,
+  reloadInvestigations: () =>
+    state.id
+      ? loadInvestigations(state.id, state.investigationSessionRevision)
+      : Promise.resolve(),
+});
+
 async function initialize() {
   try {
     const [health, sessions, experiments] = await Promise.all([
@@ -954,6 +975,7 @@ async function initialize() {
       api("/api/experiments"),
     ]);
     state.health = health;
+    agentWorkspace.syncHealth(health.agent);
     state.sessions = sessions;
     state.experiments = experiments;
     state.experimentsLoaded = true;

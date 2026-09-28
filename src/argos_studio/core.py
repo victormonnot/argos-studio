@@ -26,6 +26,13 @@ MAX_EXPERIMENTS = 20
 MAX_EXPERIMENT_PLAN_BYTES = 64 * 1024
 MAX_EXPERIMENT_RESULT_BYTES = 4 * 1024 * 1024
 EXPERIMENT_TERMINAL_STATUSES = {"completed", "cancelled", "interrupted", "failed", "expired"}
+MAX_AGENT_RUNS = 50
+MAX_AGENT_STEPS = 32
+MAX_AGENT_STEP_BYTES = 64 * 1024
+MAX_AGENT_USAGE_BYTES = 4 * 1024
+MAX_AGENT_CONTEXT_BYTES = 16 * 1024
+AGENT_TERMINAL_STATUSES = {"completed", "cancelled", "failed", "interrupted", "limited"}
+AGENT_STEP_KINDS = {"tool_call", "tool_result", "provider_usage"}
 SAMPLE_FIELDS = (
     "source_time_s",
     "elapsed_s",
@@ -90,16 +97,21 @@ class Store:
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version > 3:
+        if version > 4:
             raise ValueError(f"Database schema version {version} requires a newer ARGOS Studio")
+        if version == 4:
+            return
         if version == 3:
+            Store._migrate_agents(connection)
             return
         if version == 2:
             Store._migrate_experiments(connection)
+            Store._migrate_agents(connection)
             return
         if version == 1:
             Store._migrate_investigations(connection)
             Store._migrate_experiments(connection)
+            Store._migrate_agents(connection)
             return
         # Build the replacement before dropping the old table. Renaming the old
         # table first would rewrite the foreign keys in samples and events.
@@ -200,6 +212,7 @@ class Store:
             connection.execute("PRAGMA foreign_keys=ON")
         Store._migrate_investigations(connection)
         Store._migrate_experiments(connection)
+        Store._migrate_agents(connection)
 
     @staticmethod
     def _migrate_investigations(connection: sqlite3.Connection) -> None:
@@ -255,6 +268,40 @@ class Store:
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise ValueError("Database migration found inconsistent foreign keys")
             connection.execute("PRAGMA user_version=3")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_agents(connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "CREATE TABLE agent_runs ("
+                "id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), "
+                "prompt TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, "
+                "context TEXT NOT NULL, "
+                "status TEXT NOT NULL CHECK(status IN "
+                "('running','completed','cancelled','failed','interrupted','limited')), "
+                "created_at REAL NOT NULL, ended_at REAL, answer TEXT, error TEXT, usage TEXT)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX one_running_agent ON agent_runs((1)) WHERE status='running'"
+            )
+            connection.execute(
+                "CREATE INDEX agent_session ON agent_runs(session_id,created_at DESC)"
+            )
+            connection.execute(
+                "CREATE TABLE agent_steps ("
+                "run_id TEXT NOT NULL REFERENCES agent_runs(id), "
+                "seq INTEGER NOT NULL CHECK(seq >= 0), "
+                "kind TEXT NOT NULL CHECK(kind IN ('tool_call','tool_result','provider_usage')), "
+                "created_at REAL NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(run_id,seq))"
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ValueError("Database migration found inconsistent foreign keys")
+            connection.execute("PRAGMA user_version=4")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -695,6 +742,192 @@ class Store:
                 (now, now),
             ).rowcount
             return running + expired
+
+    @staticmethod
+    def _agent_json(value: Any, name: str, max_bytes: int) -> str:
+        """Retain JSON objects without implicit key or container conversions."""
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} must be an object")
+        pending = [value]
+        visited = set()
+        while pending:
+            item = pending.pop()
+            if isinstance(item, dict):
+                if id(item) in visited:
+                    continue
+                visited.add(id(item))
+                if any(not isinstance(key, str) for key in item):
+                    raise ValueError(f"{name} must contain only string object keys")
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                if id(item) in visited:
+                    continue
+                visited.add(id(item))
+                pending.extend(item)
+            elif item is not None and not isinstance(item, (str, bool, int, float)):
+                raise ValueError(f"{name} must contain finite JSON data")
+        return _json_object(value, name, max_bytes=max_bytes)
+
+    @staticmethod
+    def _require_agent_run(
+        connection: sqlite3.Connection, session_id: str, run_id: str
+    ) -> sqlite3.Row:
+        Store._require_session(connection, session_id)
+        row = connection.execute(
+            "SELECT * FROM agent_runs WHERE session_id=? AND id=?", (session_id, run_id)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown agent run: {run_id}")
+        return row
+
+    @staticmethod
+    def _agent_run(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["context"] = json.loads(result["context"])
+        result["usage"] = None if result["usage"] is None else json.loads(result["usage"])
+        return result
+
+    @staticmethod
+    def _agent_step(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result.pop("run_id")
+        result["payload"] = json.loads(result["payload"])
+        return result
+
+    @staticmethod
+    def _agent_run_detail(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            **Store._agent_run(row),
+            "steps": [
+                Store._agent_step(step)
+                for step in connection.execute(
+                    "SELECT * FROM agent_steps WHERE run_id=? ORDER BY seq", (row["id"],)
+                )
+            ],
+        }
+
+    def create_agent_run(
+        self,
+        session_id: str,
+        prompt: str,
+        provider: str,
+        model: str,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Reserve one bounded agent execution without changing session evidence."""
+        prompt = _text(prompt, "prompt", 4000)
+        provider = _text(provider, "provider", 120)
+        model = _text(model, "model", 120)
+        encoded = self._agent_json(
+            {} if context is None else context, "context", MAX_AGENT_CONTEXT_BYTES
+        )
+        run_id = str(uuid4())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            count = connection.execute(
+                "SELECT COUNT(*) FROM agent_runs WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+            if count >= MAX_AGENT_RUNS:
+                raise ValueError(f"A session may contain at most {MAX_AGENT_RUNS} agent runs")
+            if connection.execute("SELECT 1 FROM agent_runs WHERE status='running'").fetchone():
+                raise ValueError("Another agent run is already running")
+            connection.execute(
+                "INSERT INTO agent_runs "
+                "(id,session_id,prompt,provider,model,context,status,created_at) "
+                "VALUES (?,?,?,?,?,?,'running',?)",
+                (run_id, session_id, prompt, provider, model, encoded, time.time()),
+            )
+            return self._agent_run_detail(
+                connection, self._require_agent_run(connection, session_id, run_id)
+            )
+
+    def get_agent_run(self, session_id: str, run_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            # Run status and its trace must describe the same database snapshot.
+            connection.execute("BEGIN")
+            return self._agent_run_detail(
+                connection, self._require_agent_run(connection, session_id, run_id)
+            )
+
+    def list_agent_runs(self, session_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            self._require_session(connection, session_id)
+            return [
+                self._agent_run(row)
+                for row in connection.execute(
+                    "SELECT * FROM agent_runs WHERE session_id=? ORDER BY created_at DESC,id DESC",
+                    (session_id,),
+                )
+            ]
+
+    def append_agent_step(
+        self, session_id: str, run_id: str, kind: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist an exact tool call/result before an orchestrator uses it."""
+        if not isinstance(kind, str) or kind not in AGENT_STEP_KINDS:
+            raise ValueError("Unsupported agent step kind")
+        encoded = self._agent_json(payload, "payload", MAX_AGENT_STEP_BYTES)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = self._require_agent_run(connection, session_id, run_id)
+            if run["status"] != "running":
+                raise ValueError("Only a running agent run may receive steps")
+            seq = connection.execute(
+                "SELECT COUNT(*) FROM agent_steps WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            if seq >= MAX_AGENT_STEPS:
+                raise ValueError(f"An agent run may contain at most {MAX_AGENT_STEPS} steps")
+            created_at = time.time()
+            connection.execute(
+                "INSERT INTO agent_steps (run_id,seq,kind,created_at,payload) VALUES (?,?,?,?,?)",
+                (run_id, seq, kind, created_at, encoded),
+            )
+            return {
+                "seq": seq,
+                "kind": kind,
+                "created_at": created_at,
+                "payload": json.loads(encoded),
+            }
+
+    def finish_agent_run(
+        self,
+        session_id: str,
+        run_id: str,
+        status: str,
+        answer: str | None = None,
+        error: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """The first terminal outcome wins, including cancellation and resource limits."""
+        if not isinstance(status, str) or status not in AGENT_TERMINAL_STATUSES:
+            raise ValueError("Unsupported terminal agent status")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = self._require_agent_run(connection, session_id, run_id)
+            if run["status"] in AGENT_TERMINAL_STATUSES:
+                return self._agent_run_detail(connection, run)
+            answer = None if answer is None else _text(answer, "answer", 16000, empty=True)
+            error = None if error is None else _text(error, "error", 2000, empty=True)
+            encoded = (
+                None if usage is None else self._agent_json(usage, "usage", MAX_AGENT_USAGE_BYTES)
+            )
+            connection.execute(
+                "UPDATE agent_runs SET status=?,ended_at=?,answer=?,error=?,usage=? WHERE id=?",
+                (status, time.time(), answer, error, encoded, run_id),
+            )
+            return self._agent_run_detail(
+                connection, self._require_agent_run(connection, session_id, run_id)
+            )
+
+    def recover_agent_runs(self) -> int:
+        """Keep abandoned traces without inventing an observed stop or resuming requests."""
+        with self._connection() as connection:
+            return connection.execute(
+                "UPDATE agent_runs SET status='interrupted',ended_at=NULL,error=? "
+                "WHERE status='running'",
+                ("The process ended before the agent completed; execution was not resumed.",),
+            ).rowcount
 
     def snapshot(
         self,

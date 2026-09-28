@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .acquisition import Acquisition
+from .agent import AgentLimits, AgentRunner
+from .agent_provider import AgentConfig, OpenAIProvider, Provider, ProviderError
 from .argos_import import read_argos_recording
 from .core import MAX_EXPERIMENTS, MAX_INVESTIGATIONS, Store
 from .experiments import PROPOSAL_TTL_S, ExperimentRunner, SyntheticProtocol
@@ -44,6 +46,8 @@ class Settings:
     max_duration_s: float = MAX_DURATION_S
     dropout_duration_s: float = 2
     experiment_protocol: SyntheticProtocol = field(default_factory=SyntheticProtocol)
+    agent_config: AgentConfig = field(default_factory=AgentConfig.from_env)
+    agent_limits: AgentLimits = field(default_factory=AgentLimits)
 
     def import_available(self) -> bool:
         if not self.argos_root or not self.argos_python:
@@ -86,10 +90,19 @@ class EmptyAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(min_length=1, max_length=4000)
+    start_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    end_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
 Bound = Annotated[float | None, Query(ge=0, allow_inf_nan=False)]
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, *, agent_provider: Provider | None = None
+) -> FastAPI:
     settings = settings or Settings()
 
     @asynccontextmanager
@@ -106,6 +119,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store = Store(settings.data_dir / "studio.sqlite3")
             store.recover_interrupted()
             store.recover_experiments()
+            store.recover_agent_runs()
             runtime = Acquisition(
                 store,
                 period_s=settings.period_s,
@@ -123,9 +137,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 max_sessions=MAX_SESSIONS,
             )
             app.state.experiments = runner
+            provider = agent_provider
+            if provider is None and settings.agent_config.reason is None:
+                provider = OpenAIProvider(settings.agent_config)
+            agent = AgentRunner(
+                store,
+                runner,
+                provider,
+                unavailable_reason=None if provider else settings.agent_config.reason,
+                limits=settings.agent_limits,
+            )
+            app.state.agent = agent
             try:
                 yield
             finally:
+                await agent.close()
                 await runner.close()
                 if runtime.active:
                     await runtime.stop(runtime.session_id, status="interrupted")
@@ -224,6 +250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "max_experiments_per_session": MAX_EXPERIMENTS,
             },
             "investigation": {"algorithm_version": ALGORITHM_VERSION, "uses_llm": False},
+            "agent": app.state.agent.health(),
             "experiment": {
                 "active_id": app.state.experiments.experiment_id
                 if app.state.experiments.active
@@ -276,6 +303,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/sessions/{session_id}/analysis")
     def analyze(session_id: str, start_s: Bound = None, end_s: Bound = None):
         return app.state.store.analyze(session_id, start_s=start_s, end_s=end_s)
+
+    @app.post("/api/sessions/{session_id}/agent-runs", status_code=202)
+    async def start_agent_run(session_id: str, body: AgentRequest):
+        try:
+            return app.state.agent.start(session_id, **body.model_dump())
+        except ProviderError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/agent-runs")
+    def list_agent_runs(session_id: str):
+        return app.state.store.list_agent_runs(session_id)
+
+    @app.get("/api/sessions/{session_id}/agent-runs/{run_id}")
+    def get_agent_run(session_id: str, run_id: str):
+        return app.state.store.get_agent_run(session_id, run_id)
+
+    @app.post("/api/sessions/{session_id}/agent-runs/{run_id}/cancel")
+    async def cancel_agent_run(session_id: str, run_id: str, body: EmptyAction):
+        try:
+            return await app.state.agent.cancel(session_id, run_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/agent-runs/{run_id}/export")
+    def export_agent_run(session_id: str, run_id: str):
+        run = app.state.store.get_agent_run(session_id, run_id)
+        if run["status"] == "running":
+            raise HTTPException(409, "Terminez ou annulez la demande avant d’exporter sa trace.")
+        return Response(
+            json.dumps(run, ensure_ascii=False, allow_nan=False),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="argos-agent-{run["id"]}.json"'},
+        )
 
     @app.post("/api/sessions/{session_id}/investigations", status_code=201)
     def run_investigation(session_id: str, body: Investigation):

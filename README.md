@@ -9,7 +9,8 @@ optional adapter imports existing ARGOS recordings through their native
 validator. Versioned reception investigations retain findings, evidence and
 proposed checks across sessions. A bounded synthetic experiment can compare an
 unperturbed control with a deliberate interruption. The interface is currently
-in French; source code and technical documentation are in English.
+in French; source code and technical documentation are in English. An optional
+agent can use the same instruments and retain an inspectable trace of its work.
 
 ## Run locally
 
@@ -150,6 +151,76 @@ comparison as JSON; each linked session has its own full measurement export.
 No language model, simulator binary or vehicle connection is involved in this
 synthetic protocol.
 
+## Connect an investigation agent
+
+The agent is disabled by default. Configure the OpenAI adapter and an explicit
+model supporting Responses function calling before starting Studio:
+
+```sh
+export ARGOS_STUDIO_AGENT_PROVIDER=openai
+export ARGOS_STUDIO_AGENT_MODEL=YOUR_MODEL_ID
+read -rs -p 'OpenAI API key: ' OPENAI_API_KEY
+export OPENAI_API_KEY
+.venv/bin/argos-studio
+```
+
+The `read` example uses Bash and keeps the key out of shell history. Credentials
+are read from the server environment, never from the browser or database.
+Studio does not load `.env` files. Missing configuration leaves all recording,
+investigation and synthetic experiment functions usable. An available adapter
+means configuration is present, not that credentials or model access have been
+validated; provider errors appear on the corresponding request.
+
+Select a session and time window, then use **Investiguer avec l’agent**. For example:
+“Examine cette interruption, conserve les preuves et prépare un essai synthétique
+pour vérifier la signature observée.” The initial window is fixed to the recorded
+duration when the request starts. Each question starts independently; prior
+conversation text is not automatically sent. Saved reports and related experiments
+are discoverable through tools.
+
+The provider receives the question, session name/objective/provenance, recent
+annotations and report/experiment references, then the excerpts requested by its
+tools. The complete raw recording, UDP bytes, arbitrary metadata and local paths
+are not sent by these tools. The interface states this transfer before submission.
+The server contacts the fixed OpenAI HTTPS endpoint; it does not accept arbitrary
+provider URLs. Requests use `store: false`; this is not a claim of zero provider
+retention. See the official [Responses state handling](https://developers.openai.com/api/docs/guides/migrate-to-responses)
+and [function calling protocol](https://developers.openai.com/api/docs/guides/function-calling).
+
+| Instrument | Result |
+| --- | --- |
+| Session context | Declared provenance, objective, recent notes and saved evidence references |
+| Measurement window | Up to 100 samples; continuity calculated over the complete selected window |
+| Reception investigation | A new immutable deterministic report with evidence references |
+| Saved investigation | A bounded excerpt from a report belonging to this session |
+| Synthetic experiment preparation | A persisted proposal for the existing fixed protocol |
+| Experiment result | Protocol, lifecycle and measured comparison for a related experiment |
+
+Every tool call and result is saved before the provider continues. Excerpts state
+their truncation; full reports remain accessible in Studio. The interface separates
+the model's text from tool traces and derives evidence links from tool results.
+A language-model answer can be mistaken; the retained measurements and deterministic
+reports remain the evidence. Neither an annotation nor a model response grants
+additional actions. Tools cannot start acquisition, launch an experiment, issue a
+vehicle command, read arbitrary files or execute code. Examine a prepared proposal
+and launch it separately in the experiment panel.
+
+One request runs at a time, bounded to six provider calls, eight tool calls
+(including the initial context), 2,000 output tokens per call, 6,000 in total,
+and a 90-second execution deadline. Each HTTP call has a 30-second network
+timeout. Requests and responses are capped at 256/512 KiB; tool results at 48 KiB.
+These limits bound work, not a monetary amount. API usage is billed by the chosen
+provider/model; set any spending restriction in that provider's account.
+
+Cancellation stops further calls and preserves completed tool results. A local
+tool already executing is drained before the request becomes terminal; an already
+submitted remote request may still incur usage. Repeated identical report/proposal
+calls in one request reuse their first result. There are no automatic retries,
+provider fallbacks or restarts. Shutdown and crash recovery preserve incomplete
+traces without resuming them. Final answers, known token usage and errors survive
+reload and can be exported as JSON. Opaque provider reasoning used for continuation
+is held only in memory and is not displayed or stored in the trace.
+
 ## Receive a local MAVLink/SITL stream
 
 Select **MAVLink local · SITL déclaré**, enter a name and objective, and confirm
@@ -239,7 +310,7 @@ capture date is retained as metadata without assuming clock synchronization.
 ## Data and limits
 
 Data is stored in the ignored `.data/` directory by default: a SQLite database
-for sessions, samples, events, investigations, experiments and raw UDP datagrams,
+for sessions, samples, events, investigations, experiments, agent traces and raw UDP datagrams,
 and `recordings/` for imported originals.
 `ARGOS_STUDIO_DATA_DIR` also selects the directory. An interrupted acquisition is
 retained and marked as interrupted when the application restarts. Earlier Studio
@@ -263,6 +334,7 @@ the separate capture export includes every retained datagram's bytes.
 | Investigations per session | 50 immutable reports, up to 4 MiB each |
 | Experiment proposals per originating session | 20; protocol up to 64 KiB, result up to 4 MiB |
 | Synthetic experiment | Two 6-second captures; 20-second execution deadline; 10-minute proposal expiry |
+| Agent history per session | 50 requests, up to 32 trace steps of 64 KiB each; final text up to 16,000 characters |
 
 There is no automatic deletion or total disk quota. When the session limit is
 reached, retain the existing directory and start with another data directory.
@@ -270,7 +342,7 @@ For a backup, stop the server and copy the **whole** data directory, including
 any SQLite auxiliary files and original recordings.
 
 The implemented live profile is local UDP reception for declared simulation.
-TCP, serial/USB acquisition, hardware commands, language-model integration and
+TCP, serial/USB acquisition, hardware commands, local-model adapters and
 integrated UAV Debugger/Meridian modules are outside this version.
 
 ## Implementation and API
@@ -284,6 +356,9 @@ integrated UAV Debugger/Meridian modules are outside this version.
 | [`investigation.py`](src/argos_studio/investigation.py) | Snapshot-based reception tools, evidence references and versioned reports |
 | [`experiments.py`](src/argos_studio/experiments.py) | Consume a proposal once, execute two bounded synthetic captures and retain outcomes |
 | [`comparison.py`](src/argos_studio/comparison.py) | Check comparability, link intervention evidence and compare measured receipt intervals |
+| [`agent.py`](src/argos_studio/agent.py) | Bound provider/tool calls, cancellation and persistent execution traces |
+| [`agent_tools.py`](src/argos_studio/agent_tools.py) | Strict session-scoped access to existing instruments and evidence |
+| [`agent_provider.py`](src/argos_studio/agent_provider.py) | Opt-in OpenAI Responses adapter with server-side credentials |
 | [`app.py`](src/argos_studio/app.py) | Local FastAPI endpoints, process ownership and HTTP boundaries |
 | [`argos_import.py`](src/argos_studio/argos_import.py) | Optional subprocess adapter to ARGOS's native recording reader |
 | [`static/`](src/argos_studio/static/) | Browser interface, charts, timeline and replay without a build step |
@@ -294,7 +369,7 @@ and response routes. Key endpoints are:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /api/health` | Runtime limits and optional import configuration |
+| `GET /api/health` | Runtime limits, optional adapters and active agent request |
 | `GET /api/sessions` / `POST /api/sessions` | List sessions or start synthetic/MAVLink UDP acquisition |
 | `GET /api/sessions/{id}` | Measurements, events and source status; optional `start_s` / `end_s` |
 | `POST /api/sessions/{id}/annotations` | Attach an observation to a session time |
@@ -307,6 +382,9 @@ and response routes. Key endpoints are:
 | `GET /api/experiments/{experiment_id}` | Inspect proposal, status, linked captures and comparison |
 | `POST /api/experiments/{experiment_id}/start` / `cancel` | Start a valid proposal once, or cancel the sequence |
 | `GET /api/experiments/{experiment_id}/export` | Export a terminal experiment and its result |
+| `GET` / `POST /api/sessions/{id}/agent-runs` | List requests or submit a question with optional window bounds |
+| `GET /api/sessions/{id}/agent-runs/{run_id}` | Inspect answer, lifecycle and tool trace; append `/export` for terminal JSON |
+| `POST /api/sessions/{id}/agent-runs/{run_id}/cancel` | Cancel further provider/tool calls and preserve the trace |
 | `GET /api/sessions/{id}/export` / `raw` | Export session JSON or retrieve an imported original |
 | `GET /api/sessions/{id}/capture` | Export a stopped MAVLink session's raw UDP evidence |
 | `POST /api/import/argos` | Validate and import a native recording |
@@ -315,7 +393,8 @@ Writes use JSON, except the import endpoint, which accepts
 `application/octet-stream`. Browser writes are restricted to the same origin.
 Investigation requests accept `start_s`, `end_s` and `context` (up to 2,000
 characters). Omitted bounds select the whole persisted session; explicit bounds
-must be finite, ordered and within its recorded duration. All tools run locally.
+must be finite, ordered and within its recorded duration. Domain tools run locally;
+the optional agent sends their bounded outputs to its configured provider.
 Experiment preparation, start and cancellation accept only `{}`. Protocols are
 defined by the server; arbitrary sources, durations or executable actions are
 not accepted in these requests. Starting returns HTTP 202 and reserves two
@@ -347,6 +426,11 @@ The browser suite starts its own server on port 8766 with a temporary data
 directory. It exercises capture, annotation, interruption evidence, export,
 replay, investigations, report history/export, synthetic experiment completion
 and cancellation, mobile layout and connection errors without touching saved sessions.
+Agent tests use explicit scripted provider or HTTP doubles: they validate tool
+orchestration, the Responses protocol, persistence and interface behavior without
+network access, API charges or a claim about a live model's reasoning quality.
+The default browser scenario checks the unconfigured state; live provider access
+must be configured separately to evaluate actual model behavior.
 
 ## Optional isolated SITL check
 

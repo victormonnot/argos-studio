@@ -761,3 +761,356 @@ test("experiment cancellation remains available after navigation and reload with
       });
   }
 });
+
+// These routes are explicit UI protocol doubles, never a real model response.
+async function installAgentUiDouble(page) {
+  const fixture = {
+    runs: new Map(),
+    requests: [],
+    onStart: null,
+    active() {
+      return [...this.runs.values()].find((run) => run.status === "running");
+    },
+  };
+  await page.route("**/api/health", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    const active = fixture.active();
+    body.agent = {
+      available: true,
+      provider: "test-double",
+      model: "scripted-browser-fixture",
+      reason: null,
+      sends_data_off_machine: true,
+      active_run: active
+        ? { id: active.id, session_id: active.session_id }
+        : null,
+      limits: {
+        max_rounds: 6,
+        max_tool_calls: 8,
+        max_output_tokens: 2000,
+        max_total_output_tokens: 6000,
+        deadline_s: 90,
+      },
+    };
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/sessions/*/agent-runs**", async (route) => {
+    const match = new URL(route.request().url()).pathname.match(
+      /^\/api\/sessions\/([^/]+)\/agent-runs(?:\/([^/]+))?(?:\/(cancel|export))?$/,
+    );
+    if (!match) return route.fallback();
+    const [, sessionId, id, action] = match;
+    const method = route.request().method();
+    if (method === "POST" && !id) {
+      const body = route.request().postDataJSON();
+      fixture.requests.push({ sessionId, body });
+      const run = {
+        id: `test-double-run-${fixture.runs.size + 1}`,
+        session_id: sessionId,
+        prompt: body.prompt,
+        provider: "test-double",
+        model: "scripted-browser-fixture",
+        status: "running",
+        created_at: Date.now() / 1000,
+        ended_at: null,
+        context: {
+          window_s: { start_s: body.start_s ?? 0, end_s: body.end_s ?? 0.3 },
+        },
+        answer: null,
+        error: null,
+        usage: null,
+        steps: [],
+      };
+      fixture.runs.set(run.id, run);
+      if (fixture.onStart) await fixture.onStart(run);
+      await route.fulfill({ status: 202, json: run });
+    } else if (!id) {
+      await route.fulfill({
+        json: [...fixture.runs.values()]
+          .filter((run) => run.session_id === sessionId)
+          .reverse(),
+      });
+    } else {
+      const run = fixture.runs.get(id);
+      if (!run || run.session_id !== sessionId)
+        return route.fulfill({
+          status: 404,
+          json: { detail: "Test fixture missing" },
+        });
+      if (method === "POST" && action === "cancel") {
+        run.status = "cancelled";
+        run.ended_at = Date.now() / 1000;
+      }
+      await route.fulfill({ json: run });
+    }
+  });
+  return fixture;
+}
+
+test("an unconfigured agent stays disabled while reception tools remain available", async ({
+  page,
+}) => {
+  await prepareExperimentReference(page, "Agent non configuré");
+  await page.goto("/");
+  await expect(page.locator("#agent-provider")).toHaveText(
+    "Fournisseur non configuré",
+  );
+  await expect(page.locator("#agent-submit")).toBeDisabled();
+  await expect(page.locator("#agent-disclosure")).toContainText(
+    "Aucune requête au modèle",
+  );
+  await expect(page.locator("#investigate-button")).toBeEnabled();
+  await expect(page.locator("#source-notice")).not.toContainText(
+    "modèle de langage actif",
+  );
+});
+
+test("agent UI test-double keeps tool evidence navigable and model text inert across export and reload", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const { session, report } = await prepareExperimentReference(
+    page,
+    "Preuves de l’agent · doublure de test",
+  );
+  const prepared = await page.request.post(
+    `/api/sessions/${session.id}/investigations/${report.id}/experiments`,
+    { data: {} },
+  );
+  expect(prepared.status()).toBe(201);
+  const experiment = await prepared.json();
+  const fixture = await installAgentUiDouble(page);
+  const unsafeText =
+    "<img src=x onerror=alert(1)> [commande](javascript:alert(1))";
+  fixture.onStart = async (run) => {
+    run.status = "completed";
+    run.ended_at = Date.now() / 1000;
+    run.answer = `Doublure de test, aucun modèle appelé.\n${unsafeText}`;
+    run.context.window_s = report.window_s;
+    run.usage = { input_tokens: 12, output_tokens: 8 };
+    run.steps = [
+      {
+        seq: 0,
+        kind: "tool_call",
+        payload: {
+          call_id: "fixture-call",
+          name: "investigate_reception",
+          arguments: {},
+        },
+      },
+      {
+        seq: 1,
+        kind: "tool_result",
+        payload: {
+          call_id: "fixture-call",
+          name: "investigate_reception",
+          ok: true,
+          result: {
+            id: report.id,
+            session_id: session.id,
+            window_s: report.window_s,
+          },
+        },
+      },
+      {
+        seq: 2,
+        kind: "tool_result",
+        payload: {
+          call_id: "fixture-proposal",
+          name: "prepare_synthetic_experiment",
+          ok: true,
+          result: experiment,
+        },
+      },
+    ];
+  };
+  try {
+    await page.goto("/");
+    await expect(page.locator("#agent-provider")).toContainText("test-double");
+    await expect(page.locator("#agent-disclosure")).toContainText(
+      "transmis à test-double",
+    );
+    await page.locator("#agent-prompt").fill(unsafeText);
+    await page.locator("#agent-submit").click();
+    await expect(page.locator("#agent-run-state")).toHaveText(
+      "Investigation terminée",
+    );
+    await expect(page.locator("#agent-answer")).toContainText(unsafeText);
+    await expect(
+      page.locator("#agent-answer img, #agent-answer a, #agent-run-prompt img"),
+    ).toHaveCount(0);
+    await expect(page.locator("#agent-evidence button")).toHaveCount(3);
+    await page
+      .locator("#agent-evidence button")
+      .filter({ hasText: "Mesures :" })
+      .click();
+    await expect(page.locator("#window-start")).toHaveValue(
+      String(report.window_s.start_s),
+    );
+    await expect(page.locator("#window-end")).toHaveValue(
+      String(report.window_s.end_s),
+    );
+    await page
+      .locator("#agent-evidence button")
+      .filter({ hasText: "Ouvrir l’investigation" })
+      .click();
+    await expect(page.locator("#investigation-history")).toHaveValue(report.id);
+    await page
+      .locator("#agent-evidence button")
+      .filter({ hasText: "Examiner le protocole" })
+      .click();
+    await expect(page.locator("#experiment-history")).toHaveValue(
+      experiment.id,
+    );
+    await expect(page.locator("#experiment-start")).toBeEnabled();
+    const untouched = await (
+      await page.request.get(`/api/experiments/${experiment.id}`)
+    ).json();
+    expect(untouched.status).toBe("proposed");
+    expect(untouched.control_session_id).toBeNull();
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.locator("#agent-export").click(),
+    ]);
+    const exported = JSON.parse(await readFile(await download.path(), "utf8"));
+    expect(exported.provider).toBe("test-double");
+    expect(exported.answer).toContain(unsafeText);
+    expect(exported.steps[1].payload.result.id).toBe(report.id);
+    await page.reload();
+    await expect(page.locator("#agent-history")).toHaveValue(exported.id);
+    await expect(page.locator("#agent-answer")).toContainText(unsafeText);
+    await page.locator(".agent-trace > summary").click();
+    await expect(page.locator("#agent-steps")).toContainText(
+      "investigate_reception",
+    );
+    await page
+      .locator(".agent-panel")
+      .screenshot({ path: "test-results/agent-desktop.png" });
+    await page.setViewportSize({ width: 390, height: 844 });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(390);
+    await page
+      .locator(".agent-panel")
+      .screenshot({ path: "test-results/agent-mobile.png" });
+    expect(errors).toEqual([]);
+  } finally {
+    await page.request.post(`/api/experiments/${experiment.id}/cancel`, {
+      data: {},
+    });
+  }
+});
+
+test("agent UI test-double retains scoped drafts and global cancellation through navigation and reload", async ({
+  page,
+}) => {
+  const { session: first } = await prepareExperimentReference(
+    page,
+    "Agent actif · doublure de test",
+  );
+  const { session: second } = await prepareExperimentReference(
+    page,
+    "Autre session de l’agent",
+  );
+  const fixture = await installAgentUiDouble(page);
+  await page.goto("/");
+  await page.locator("#agent-prompt").fill("Brouillon de l’autre session");
+  await page.locator(".session-item").filter({ hasText: first.name }).click();
+  await expect(page.locator("#agent-prompt")).toHaveValue("");
+  await page.locator("#agent-prompt").fill("Demande de la session active");
+  await page.locator("#agent-submit").click();
+  await expect(page.locator("#active-agent")).toBeVisible();
+  await expect(page.locator("#agent-export")).toBeDisabled();
+  await page.locator(".session-item").filter({ hasText: second.name }).click();
+  await expect(page.locator("#agent-prompt")).toHaveValue(
+    "Brouillon de l’autre session",
+  );
+  await expect(page.locator("#agent-detail")).toBeHidden();
+  await expect(page.locator("#active-agent")).toBeVisible();
+  await page.reload();
+  await expect(page.locator("#active-agent")).toBeVisible();
+  let releaseStalePoll;
+  let pollHeld = false;
+  const stalePollGate = new Promise((resolve) => {
+    releaseStalePoll = resolve;
+  });
+  const activeId = fixture.active().id;
+  await page.route(
+    `**/api/sessions/${first.id}/agent-runs/${activeId}`,
+    async (route) => {
+      if (pollHeld || route.request().method() !== "GET")
+        return route.fallback();
+      const stale = structuredClone(fixture.runs.get(activeId));
+      pollHeld = true;
+      await stalePollGate;
+      await route.fulfill({ json: stale });
+    },
+  );
+  await expect.poll(() => pollHeld).toBe(true);
+  await page.locator("#active-agent-cancel").click();
+  await expect(page.locator("#active-agent")).toBeHidden();
+  const staleResponse = page.waitForResponse((response) =>
+    response.url().endsWith(`/agent-runs/${activeId}`),
+  );
+  releaseStalePoll();
+  await staleResponse;
+  await expect(page.locator("#active-agent")).toBeHidden();
+  expect(fixture.active()).toBeUndefined();
+  await page.locator(".session-item").filter({ hasText: first.name }).click();
+  await expect(page.locator("#agent-run-state")).toHaveText(
+    "Investigation annulée",
+  );
+  await expect(page.locator("#agent-export")).toBeEnabled();
+  await page.reload();
+  await expect(page.locator("#active-agent")).toBeHidden();
+  expect(fixture.requests).toHaveLength(1);
+});
+
+test("agent UI test-double does not replace a new session with a delayed launch response", async ({
+  page,
+}) => {
+  const { session: first } = await prepareExperimentReference(
+    page,
+    "Réponse agent retardée",
+  );
+  const { session: second } = await prepareExperimentReference(
+    page,
+    "Session conservée à l’écran",
+  );
+  const fixture = await installAgentUiDouble(page);
+  let release;
+  const responseGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  fixture.onStart = async () => responseGate;
+  try {
+    await page.goto("/");
+    await page.locator(".session-item").filter({ hasText: first.name }).click();
+    await page.locator("#agent-prompt").fill("Réponse différée");
+    await page.locator("#agent-submit").click();
+    await expect.poll(() => fixture.requests.length).toBe(1);
+    await page
+      .locator(".session-item")
+      .filter({ hasText: second.name })
+      .click();
+    await page.locator("#agent-prompt").fill("Conserver ce brouillon");
+    release();
+    await expect(page.locator("#active-agent")).toBeVisible();
+    await expect(page.locator("#active-session-title")).toHaveText(second.name);
+    await expect(page.locator("#agent-detail")).toBeHidden();
+    await expect(page.locator("#agent-prompt")).toHaveValue(
+      "Conserver ce brouillon",
+    );
+    await page.locator("#active-agent-open").click();
+    await expect(page.locator("#active-session-title")).toHaveText(first.name);
+    await expect(page.locator("#agent-run-prompt")).toHaveText(
+      "Réponse différée",
+    );
+    await page.locator("#active-agent-cancel").click();
+    await expect(page.locator("#active-agent")).toBeHidden();
+  } finally {
+    release();
+  }
+});

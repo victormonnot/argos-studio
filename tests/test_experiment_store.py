@@ -374,6 +374,8 @@ def test_version_two_migration_preserves_every_existing_record(store):
     session, report = origin(store)
     store.annotate(session["id"], "Retained note", 1)
     with store._connection() as connection:
+        connection.execute("DROP TABLE agent_steps")
+        connection.execute("DROP TABLE agent_runs")
         connection.execute("DROP TABLE experiments")
         connection.execute("DROP INDEX investigation_identity")
         connection.execute("PRAGMA user_version=2")
@@ -383,7 +385,7 @@ def test_version_two_migration_preserves_every_existing_record(store):
         }
     migrated = Store(store.path)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for table, expected in before.items():
             assert [
@@ -397,6 +399,8 @@ def test_failed_experiment_migration_rolls_back_version_and_new_objects(store):
     session, _ = origin(store)
     before = store.samples(session["id"])
     with store._connection() as connection:
+        connection.execute("DROP TABLE agent_steps")
+        connection.execute("DROP TABLE agent_runs")
         connection.execute("DROP TABLE experiments")
         connection.execute("DROP INDEX investigation_identity")
         connection.execute("PRAGMA user_version=2")
@@ -420,8 +424,8 @@ def test_failed_experiment_migration_rolls_back_version_and_new_objects(store):
 
 def test_future_schema_version_is_not_modified(store):
     with store._connection() as connection:
-        connection.execute("PRAGMA user_version=4")
+        connection.execute("PRAGMA user_version=5")
     with pytest.raises(ValueError, match="newer"):
         Store(store.path)
     with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
