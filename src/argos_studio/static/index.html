@@ -542,6 +542,23 @@
               </details>
             </aside>
           </div>
+          <section class="panel observations-panel" aria-labelledby="observations-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">OBSERVATION LOCALE · PREUVES CONSERVÉES</p>
+                <h3 id="observations-title">À examiner <span id="observations-count" class="observation-count">0</span></h3>
+              </div>
+              <label class="observation-filter"><input id="observations-show-dismissed" type="checkbox" /> Afficher les observations écartées</label>
+            </div>
+            <div class="observations-introduction">
+              <p class="small muted">Les intervalles de réception supérieurs à 0,25 s sont repérés automatiquement entre deux mesures consécutives. Ce seuil sert à l’examen des données ; il n’établit ni panne, ni perte de paquet, ni cause physique.</p>
+              <p class="small muted">Calcul local, sans appel au modèle. Les rapports et les demandes à l’agent se préparent à votre initiative.</p>
+              <p id="observations-scan" class="small muted"></p>
+              <p id="observations-status" class="investigation-status" role="status"></p>
+            </div>
+            <div id="observations-list" class="observations-list"></div>
+            <p id="observations-empty" class="small muted observation-empty">Aucun intervalle à examiner pour cette session.</p>
+          </section>
           <section class="panel agent-panel" aria-labelledby="agent-title">
             <div class="panel-header">
               <div>
@@ -576,6 +593,7 @@
                 placeholder="Examine cette interruption et les preuves disponibles. Que peut-on conclure et quelle vérification proposer ?"
               ></textarea>
               <p id="agent-window" class="small muted"></p>
+              <p id="agent-observation" class="small muted" hidden></p>
               <div class="agent-submit-row">
                 <button
                   id="agent-submit"

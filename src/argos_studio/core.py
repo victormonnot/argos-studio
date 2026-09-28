@@ -33,6 +33,10 @@ MAX_AGENT_USAGE_BYTES = 4 * 1024
 MAX_AGENT_CONTEXT_BYTES = 16 * 1024
 AGENT_TERMINAL_STATUSES = {"completed", "cancelled", "failed", "interrupted", "limited"}
 AGENT_STEP_KINDS = {"tool_call", "tool_result", "provider_usage"}
+MAX_OBSERVATIONS = 20
+OBSERVATION_SCAN_BATCH = 2000
+OBSERVATION_RULE_VERSION = "receipt-gap-watch/1"
+OBSERVATION_GAP_THRESHOLD_S = 0.25
 SAMPLE_FIELDS = (
     "source_time_s",
     "elapsed_s",
@@ -97,21 +101,27 @@ class Store:
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version > 4:
+        if version > 5:
             raise ValueError(f"Database schema version {version} requires a newer ARGOS Studio")
+        if version == 5:
+            return
         if version == 4:
+            Store._migrate_observations(connection)
             return
         if version == 3:
             Store._migrate_agents(connection)
+            Store._migrate_observations(connection)
             return
         if version == 2:
             Store._migrate_experiments(connection)
             Store._migrate_agents(connection)
+            Store._migrate_observations(connection)
             return
         if version == 1:
             Store._migrate_investigations(connection)
             Store._migrate_experiments(connection)
             Store._migrate_agents(connection)
+            Store._migrate_observations(connection)
             return
         # Build the replacement before dropping the old table. Renaming the old
         # table first would rewrite the foreign keys in samples and events.
@@ -213,6 +223,7 @@ class Store:
         Store._migrate_investigations(connection)
         Store._migrate_experiments(connection)
         Store._migrate_agents(connection)
+        Store._migrate_observations(connection)
 
     @staticmethod
     def _migrate_investigations(connection: sqlite3.Connection) -> None:
@@ -302,6 +313,43 @@ class Store:
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise ValueError("Database migration found inconsistent foreign keys")
             connection.execute("PRAGMA user_version=4")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_observations(connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "CREATE TABLE observation_scans ("
+                "session_id TEXT PRIMARY KEY REFERENCES sessions(id), "
+                "rule_version TEXT NOT NULL, "
+                "last_seq INTEGER NOT NULL DEFAULT -1 CHECK(last_seq >= -1), "
+                "omitted_gap_count INTEGER NOT NULL DEFAULT 0 CHECK(omitted_gap_count >= 0))"
+            )
+            connection.execute(
+                "CREATE TABLE observations ("
+                "id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), "
+                "kind TEXT NOT NULL CHECK(kind='receipt_gap'), rule_version TEXT NOT NULL, "
+                "created_at REAL NOT NULL, start_s REAL NOT NULL CHECK(start_s >= 0), "
+                "end_s REAL NOT NULL CHECK(end_s > start_s), "
+                "duration_s REAL NOT NULL CHECK(duration_s > 0), "
+                "before_seq INTEGER NOT NULL CHECK(before_seq >= 0), "
+                "after_seq INTEGER NOT NULL CHECK(after_seq = before_seq + 1), "
+                "source TEXT NOT NULL CHECK(source IN "
+                "('simulation','argos-recording','mavlink-udp')), evidence TEXT NOT NULL, "
+                "disposition TEXT NOT NULL DEFAULT 'open' "
+                "CHECK(disposition IN ('open','dismissed')), "
+                "investigation_id TEXT, UNIQUE(session_id,rule_version,before_seq,after_seq), "
+                "FOREIGN KEY(session_id,before_seq) REFERENCES samples(session_id,seq), "
+                "FOREIGN KEY(session_id,after_seq) REFERENCES samples(session_id,seq), "
+                "FOREIGN KEY(investigation_id,session_id) REFERENCES investigations(id,session_id))"
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ValueError("Database migration found inconsistent foreign keys")
+            connection.execute("PRAGMA user_version=5")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -460,13 +508,44 @@ class Store:
                 raise ValueError(f"report.{field} must be a {expected_type.__name__}")
         return _json_object(report, "report", max_bytes=MAX_INVESTIGATION_BYTES)
 
-    def save_investigation(self, session_id: str, report: dict[str, Any]) -> dict[str, Any]:
-        """Append an immutable report; a changed context requires a new report."""
+    def save_investigation(
+        self,
+        session_id: str,
+        report: dict[str, Any],
+        *,
+        observation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append an immutable report, optionally linking one observation atomically."""
         encoded = self._investigation_report(report)
         investigation_id, created_at = str(uuid4()), time.time()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_session(connection, session_id)
+            if observation_id is not None:
+                observation = self._require_observation(connection, session_id, observation_id)
+                snapshot_session = report["snapshot"].get("session")
+                window = report["window_s"]
+                for endpoint in ("start_s", "end_s"):
+                    _number(window.get(endpoint), f"window_s.{endpoint}", minimum=0)
+                if (
+                    report["kind"] != "reception_quality"
+                    or report["window_s"]
+                    != {"start_s": observation["start_s"], "end_s": observation["end_s"]}
+                    or report["snapshot"].get("source") != observation["source"]
+                    or not isinstance(snapshot_session, dict)
+                    or snapshot_session.get("id") != session_id
+                    or snapshot_session.get("source") != observation["source"]
+                ):
+                    raise ValueError("Investigation must match the observation session and window")
+                if observation["investigation_id"] is not None:
+                    saved = dict(
+                        connection.execute(
+                            "SELECT * FROM investigations WHERE id=? AND session_id=?",
+                            (observation["investigation_id"], session_id),
+                        ).fetchone()
+                    )
+                    saved_report = json.loads(saved.pop("report"))
+                    return {**saved, **saved_report}
             count = connection.execute(
                 "SELECT COUNT(*) FROM investigations WHERE session_id=?", (session_id,)
             ).fetchone()[0]
@@ -478,6 +557,11 @@ class Store:
                 "INSERT INTO investigations (id,session_id,created_at,report) VALUES (?,?,?,?)",
                 (investigation_id, session_id, created_at, encoded),
             )
+            if observation_id is not None:
+                connection.execute(
+                    "UPDATE observations SET investigation_id=? WHERE id=? AND session_id=?",
+                    (investigation_id, observation_id, session_id),
+                )
         return {
             "id": investigation_id,
             "session_id": session_id,
@@ -518,6 +602,164 @@ class Store:
             result = dict(row)
             report = json.loads(result.pop("report"))
             return {**result, **report}
+
+    @staticmethod
+    def _require_observation(
+        connection: sqlite3.Connection, session_id: str, observation_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM observations WHERE session_id=? AND id=?",
+            (session_id, observation_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown observation: {observation_id}")
+        return row
+
+    @staticmethod
+    def _observation(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["evidence"] = json.loads(result["evidence"])
+        return result
+
+    @staticmethod
+    def _observations_snapshot(connection: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+        scan = connection.execute(
+            "SELECT last_seq,omitted_gap_count FROM observation_scans WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        last_seq = scan["last_seq"] if scan else -1
+        last_sample_seq = connection.execute(
+            "SELECT COALESCE(MAX(seq),-1) FROM samples WHERE session_id=?", (session_id,)
+        ).fetchone()[0]
+        return {
+            "items": [
+                Store._observation(row)
+                for row in connection.execute(
+                    "SELECT * FROM observations WHERE session_id=? ORDER BY before_seq,id",
+                    (session_id,),
+                )
+            ],
+            "scan": {
+                "last_seq": last_seq,
+                "last_sample_seq": last_sample_seq,
+                "complete": last_seq == last_sample_seq,
+                "omitted_gap_count": scan["omitted_gap_count"] if scan else 0,
+            },
+        }
+
+    def list_observations(self, session_id: str) -> dict[str, Any]:
+        """Read observations and scan progress from the same database snapshot."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            self._require_session(connection, session_id)
+            return self._observations_snapshot(connection, session_id)
+
+    def get_observation(self, session_id: str, observation_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            self._require_session(connection, session_id)
+            return self._observation(
+                self._require_observation(connection, session_id, observation_id)
+            )
+
+    def set_observation_disposition(
+        self, session_id: str, observation_id: str, disposition: str
+    ) -> dict[str, Any]:
+        if disposition not in ("open", "dismissed"):
+            raise ValueError("Observation disposition must be open or dismissed")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            self._require_observation(connection, session_id, observation_id)
+            connection.execute(
+                "UPDATE observations SET disposition=? WHERE session_id=? AND id=?",
+                (disposition, session_id, observation_id),
+            )
+            return self._observation(
+                self._require_observation(connection, session_id, observation_id)
+            )
+
+    def scan_observations(
+        self, session_id: str, *, limit: int = OBSERVATION_SCAN_BATCH
+    ) -> dict[str, Any]:
+        """Persist bounded adjacent receipt gaps and advance their cursor atomically.
+
+        Only pairs with a newly received right endpoint are examined. At the
+        observation cap the scan continues, counting omitted pairs exactly once.
+        """
+        if type(limit) is not int or not 1 <= limit <= OBSERVATION_SCAN_BATCH:
+            raise ValueError(f"limit must be an integer from 1 to {OBSERVATION_SCAN_BATCH}")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = self._require_session(connection, session_id)
+            connection.execute(
+                "INSERT OR IGNORE INTO observation_scans (session_id,rule_version) VALUES (?,?)",
+                (session_id, OBSERVATION_RULE_VERSION),
+            )
+            scan = connection.execute(
+                "SELECT * FROM observation_scans WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if scan["rule_version"] != OBSERVATION_RULE_VERSION:
+                raise ValueError("Unsupported observation scan rule version")
+            previous = connection.execute(
+                "SELECT * FROM samples WHERE session_id=? AND seq=?",
+                (session_id, scan["last_seq"]),
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT * FROM samples WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
+                (session_id, scan["last_seq"], limit),
+            ).fetchall()
+            count = connection.execute(
+                "SELECT COUNT(*) FROM observations WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+            omitted = scan["omitted_gap_count"]
+            created = 0
+            for current in rows:
+                if previous is not None:
+                    interval = current["elapsed_s"] - previous["elapsed_s"]
+                    if interval > OBSERVATION_GAP_THRESHOLD_S:
+                        exists = connection.execute(
+                            "SELECT 1 FROM observations WHERE session_id=? AND rule_version=? "
+                            "AND before_seq=? AND after_seq=?",
+                            (session_id, OBSERVATION_RULE_VERSION, previous["seq"], current["seq"]),
+                        ).fetchone()
+                        if exists is None and count < MAX_OBSERVATIONS:
+                            evidence = {
+                                "before_sample": dict(previous),
+                                "after_sample": dict(current),
+                                "source": session["source"],
+                                "status_at_detection": session["status"],
+                                "threshold_s": OBSERVATION_GAP_THRESHOLD_S,
+                            }
+                            connection.execute(
+                                "INSERT INTO observations "
+                                "(id,session_id,kind,rule_version,created_at,start_s,end_s,duration_s,"
+                                "before_seq,after_seq,source,evidence) "
+                                "VALUES (?,?,'receipt_gap',?,?,?,?,?,?,?,?,?)",
+                                (
+                                    str(uuid4()),
+                                    session_id,
+                                    OBSERVATION_RULE_VERSION,
+                                    time.time(),
+                                    previous["elapsed_s"],
+                                    current["elapsed_s"],
+                                    interval,
+                                    previous["seq"],
+                                    current["seq"],
+                                    session["source"],
+                                    _json_object(evidence, "observation evidence"),
+                                ),
+                            )
+                            count += 1
+                            created += 1
+                        elif exists is None:
+                            omitted += 1
+                previous = current
+            last_seq = rows[-1]["seq"] if rows else scan["last_seq"]
+            connection.execute(
+                "UPDATE observation_scans SET last_seq=?,omitted_gap_count=? WHERE session_id=?",
+                (last_seq, omitted, session_id),
+            )
+            return {**self._observations_snapshot(connection, session_id), "created_count": created}
 
     @staticmethod
     def _require_experiment(connection: sqlite3.Connection, experiment_id: str) -> sqlite3.Row:

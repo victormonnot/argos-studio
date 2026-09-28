@@ -95,12 +95,22 @@ class AgentRunner:
             "limits": asdict(self.limits),
         }
 
-    def start(self, session_id: str, prompt: str, start_s=None, end_s=None) -> dict:
+    def start(
+        self, session_id: str, prompt: str, start_s=None, end_s=None, observation_id=None
+    ) -> dict:
         if not self.provider:
             raise ProviderError(self.reason or "Agent non configuré.")
         if self.active_run:
             raise ValueError("Une demande est déjà en cours. Attendez ou annulez-la.")
         session = self.store.get_session(session_id)
+        observation = (
+            self.store.get_observation(session_id, observation_id) if observation_id else None
+        )
+        if observation is not None:
+            start_s = observation["start_s"] if start_s is None else start_s
+            end_s = observation["end_s"] if end_s is None else end_s
+            if start_s != observation["start_s"] or end_s != observation["end_s"]:
+                raise ValueError("La demande doit conserver la fenêtre de l’observation liée.")
         window = {
             "start_s": 0 if start_s is None else start_s,
             "end_s": session["elapsed_s"] if end_s is None else end_s,
@@ -114,12 +124,15 @@ class AgentRunner:
             raise ValueError("La fenêtre doit appartenir à la durée enregistrée.")
         if window["end_s"] < window["start_s"]:
             raise ValueError("La fin de fenêtre doit suivre son début.")
+        context = {"window_s": window, "limits": asdict(self.limits)}
+        if observation is not None:
+            context["observation_id"] = observation["id"]
         run = self.store.create_agent_run(
             session_id,
             prompt,
             self.provider.provider,
             self.provider.model,
-            context={"window_s": window, "limits": asdict(self.limits)},
+            context=context,
         )
         self._run = run
         self._stop_status = "cancelled"
@@ -235,7 +248,11 @@ class AgentRunner:
         try:
             async with asyncio.timeout(self.limits.deadline_s):
                 tools = Toolset(
-                    self.store, self.experiments, sid, default_window=run["context"]["window_s"]
+                    self.store,
+                    self.experiments,
+                    sid,
+                    default_window=run["context"]["window_s"],
+                    observation_id=run["context"].get("observation_id"),
                 )
                 initial = await invoke("initial_context", "get_session_context", {})
                 messages = [

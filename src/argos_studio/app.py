@@ -25,6 +25,7 @@ from .core import MAX_EXPERIMENTS, MAX_INVESTIGATIONS, Store
 from .experiments import PROPOSAL_TTL_S, ExperimentRunner, SyntheticProtocol
 from .investigation import ALGORITHM_VERSION, investigate
 from .mavlink import MAX_DATAGRAMS, MAX_RAW_BYTES, MAX_SAMPLES, dialect
+from .observations import ObservationMonitor, investigate_observation
 
 MAX_IMPORT_BYTES = 10 * 1024 * 1024
 MAX_SESSIONS = 100
@@ -49,6 +50,7 @@ class Settings:
     experiment_protocol: SyntheticProtocol = field(default_factory=SyntheticProtocol)
     agent_config: AgentConfig = field(default_factory=AgentConfig.from_env)
     agent_limits: AgentLimits = field(default_factory=AgentLimits)
+    observation_interval_s: float = 1
 
     def import_available(self) -> bool:
         if not self.argos_root or not self.argos_python:
@@ -94,8 +96,9 @@ class EmptyAction(BaseModel):
 class AgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(min_length=1, max_length=4000)
-    start_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    end_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    start_s: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    end_s: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    observation_id: str | None = Field(default=None, min_length=1, max_length=80)
 
 
 Bound = Annotated[float | None, Query(ge=0, allow_inf_nan=False)]
@@ -151,9 +154,13 @@ def create_app(
                 limits=settings.agent_limits,
             )
             app.state.agent = agent
+            monitor = ObservationMonitor(store, interval_s=settings.observation_interval_s)
+            app.state.observations = monitor
+            monitor.start()
             try:
                 yield
             finally:
+                await monitor.close()
                 await agent.close()
                 await runner.close()
                 if runtime.active:
@@ -254,6 +261,7 @@ def create_app(
             },
             "investigation": {"algorithm_version": ALGORITHM_VERSION, "uses_llm": False},
             "agent": app.state.agent.health(),
+            "observation": app.state.observations.health(),
             "experiment": {
                 "active_id": app.state.experiments.experiment_id
                 if app.state.experiments.active
@@ -315,6 +323,29 @@ def create_app(
             raise HTTPException(503, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/observations")
+    def list_observations(session_id: str):
+        return {
+            **app.state.store.list_observations(session_id),
+            "monitor": app.state.observations.health(),
+        }
+
+    @app.get("/api/sessions/{session_id}/observations/{observation_id}")
+    def get_observation(session_id: str, observation_id: str):
+        return app.state.store.get_observation(session_id, observation_id)
+
+    @app.post("/api/sessions/{session_id}/observations/{observation_id}/investigate")
+    def inspect_observation(session_id: str, observation_id: str, body: EmptyAction):
+        return investigate_observation(app.state.store, session_id, observation_id)
+
+    @app.post("/api/sessions/{session_id}/observations/{observation_id}/dismiss")
+    def dismiss_observation(session_id: str, observation_id: str, body: EmptyAction):
+        return app.state.store.set_observation_disposition(session_id, observation_id, "dismissed")
+
+    @app.post("/api/sessions/{session_id}/observations/{observation_id}/reopen")
+    def reopen_observation(session_id: str, observation_id: str, body: EmptyAction):
+        return app.state.store.set_observation_disposition(session_id, observation_id, "open")
 
     @app.get("/api/sessions/{session_id}/agent-runs")
     def list_agent_runs(session_id: str):

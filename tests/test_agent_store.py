@@ -432,6 +432,8 @@ def test_version_three_migration_preserves_every_existing_record(store):
     )
     store.finish_session(udp["id"])
     with store._connection() as connection:
+        connection.execute("DROP TABLE observations")
+        connection.execute("DROP TABLE observation_scans")
         connection.execute("DROP TABLE agent_steps")
         connection.execute("DROP TABLE agent_runs")
         connection.execute("PRAGMA user_version=3")
@@ -448,7 +450,7 @@ def test_version_three_migration_preserves_every_existing_record(store):
         }
     migrated = Store(store.path)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for table, expected in before.items():
@@ -462,6 +464,8 @@ def test_version_three_migration_preserves_every_existing_record(store):
 def test_agent_migration_failure_rolls_back_schema_version_and_new_objects(store):
     origin = session(store)
     with store._connection() as connection:
+        connection.execute("DROP TABLE observations")
+        connection.execute("DROP TABLE observation_scans")
         connection.execute("DROP TABLE agent_steps")
         connection.execute("DROP TABLE agent_runs")
         connection.execute("PRAGMA user_version=3")

@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .core import Store
 from .experiments import ExperimentRunner
-from .investigation import investigate
+from .investigation import build_report, investigate
 
 MAX_OUTPUT_BYTES = 48 * 1024
 MAX_SAMPLES = 100
@@ -70,7 +70,8 @@ TOOLS = {
     "investigate_reception": (
         InvestigationArguments,
         "Enregistrer une investigation déterministe et ses preuves sur la fenêtre demandée. "
-        "Le contexte est du texte conservé, sans exécution. Une borne nulle reprend la sélection.",
+        "Le contexte est du texte conservé, sans exécution. Une borne nulle reprend la sélection. "
+        "La fenêtre d’une observation liée réutilise son rapport s’il existe déjà.",
     ),
     "read_investigation": (
         ReportArguments,
@@ -274,10 +275,12 @@ class Toolset:
         session_id: str,
         *,
         default_window: dict | None = None,
+        observation_id: str | None = None,
     ):
         self.store = store
         self.experiments = experiments
         self.session_id = session_id
+        self.observation_id = observation_id
         self.default_window = WindowArguments.model_validate(
             default_window if default_window is not None else {"start_s": None, "end_s": None}
         ).model_dump()
@@ -324,7 +327,8 @@ class Toolset:
         annotations = [event for event in snapshot["events"] if event["kind"] == "annotation"]
         reports = self.store.list_investigations(self.session_id)
         experiments = [item for item in self.store.list_experiments() if self._related(item)]
-        return {
+        observations = self.store.list_observations(self.session_id)
+        result = {
             "session": _pick(
                 session,
                 "id name objective source status elapsed_s sample_count created_at ended_at",
@@ -350,12 +354,23 @@ class Toolset:
                 )
                 for item in experiments[:10]
             ],
+            "observations": [
+                _pick(item, "id kind start_s end_s duration_s disposition investigation_id")
+                for item in observations["items"][-10:]
+            ],
+            "observation_scan": observations["scan"],
             "omitted": {
                 "annotations": max(0, len(annotations) - 10),
                 "investigations": max(0, len(reports) - 10),
                 "experiments": max(0, len(experiments) - 10),
+                "observations": max(0, len(observations["items"]) - 10),
             },
         }
+        if self.observation_id is not None:
+            result["trigger_observation"] = self.store.get_observation(
+                self.session_id, self.observation_id
+            )
+        return result
 
     def _measurements(self, start_s, end_s, limit) -> dict:
         session = self.store.get_session(self.session_id)
@@ -375,6 +390,27 @@ class Toolset:
     def _investigate(self, start_s, end_s, context) -> dict:
         session = self.store.get_session(self.session_id)
         window = self._window(start_s, end_s, session["elapsed_s"])
+        if self.observation_id is not None:
+            observation = self.store.get_observation(self.session_id, self.observation_id)
+            if window == {"start_s": observation["start_s"], "end_s": observation["end_s"]}:
+                existing_id = observation["investigation_id"]
+                if existing_id is not None:
+                    report = self.store.get_investigation(self.session_id, existing_id)
+                else:
+                    report = self.store.save_investigation(
+                        self.session_id,
+                        build_report(
+                            self.store.investigation_input(self.session_id),
+                            **window,
+                            context=context,
+                        ),
+                        observation_id=self.observation_id,
+                    )
+                return {
+                    **_report(report),
+                    "observation_id": self.observation_id,
+                    "report_previously_linked": existing_id is not None,
+                }
         return _report(investigate(self.store, self.session_id, **window, context=context))
 
     def _read_report(self, report_id) -> dict:

@@ -1114,3 +1114,200 @@ test("agent UI test-double does not replace a new session with a delayed launch 
     release();
   }
 });
+
+async function prepareObservationSession(page, name) {
+  const created = await page.request.post("/api/sessions", {
+    data: { name, objective: "Examiner un intervalle de réception synthétique." },
+  });
+  expect(created.status()).toBe(201);
+  const session = await created.json();
+  try {
+    await expect.poll(async () => {
+      const result = await (await page.request.get(`/api/sessions/${session.id}`)).json();
+      return result.session.sample_count;
+    }).toBeGreaterThan(4);
+    await page.request.post(`/api/sessions/${session.id}/dropout`, { data: {} });
+    let observations;
+    await expect.poll(async () => {
+      const result = await page.request.get(`/api/sessions/${session.id}/observations`);
+      expect(result.ok()).toBe(true);
+      observations = await result.json();
+      return observations.items.length;
+    }, { timeout: 8000 }).toBe(1);
+    return { session, observation: observations.items[0] };
+  } finally {
+    await page.request.post(`/api/sessions/${session.id}/stop`, { data: {} });
+  }
+}
+
+test("local observations preserve measured evidence, reports and dismissal without calling an agent", async ({ page }) => {
+  const errors = [];
+  const agentRequests = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/agent-runs"))
+      agentRequests.push(request.url());
+  });
+  const { session, observation } = await prepareObservationSession(
+    page, "Observation locale de réception synthétique",
+  );
+  await page.goto("/");
+  await expect(page.locator("#observations-count")).toHaveText("1");
+  const card = page.locator(`[data-observation-id="${observation.id}"]`);
+  await expect(card).toContainText("Simulation synthétique");
+  await expect(card).toContainText(`#${observation.before_seq}`);
+  await expect(card).toContainText(`#${observation.after_seq}`);
+  await card.locator("summary").click();
+  await expect(card.locator("pre")).toContainText("before_sample");
+  const original = structuredClone(observation);
+  await card.locator('[data-action="window"]').click();
+  await expect(page.locator("#window-start")).toHaveValue(String(observation.start_s));
+  await expect(page.locator("#window-end")).toHaveValue(String(observation.end_s));
+  await card.locator('[data-action="investigate"]').click();
+  await expect(page.locator("#investigation-report")).toBeVisible();
+  const saved = await (await page.request.get(`/api/sessions/${session.id}/observations`)).json();
+  const reportId = saved.items[0].investigation_id;
+  expect(reportId).toBeTruthy();
+  await expect(page.locator("#investigation-history")).toHaveValue(reportId);
+  await expect(card.locator("details")).toHaveAttribute("open", "");
+  await expect(card.locator('[data-action="investigate"]')).toHaveText("Ouvrir le rapport conservé");
+  await card.locator('[data-action="investigate"]').click();
+  const reports = await (await page.request.get(`/api/sessions/${session.id}/investigations`)).json();
+  expect(reports).toHaveLength(1);
+  expect(saved.items[0].evidence).toEqual(original.evidence);
+  expect(saved.items[0].duration_s).toBe(original.duration_s);
+  await card.locator('[data-action="agent"]').click();
+  await expect(page.locator("#agent-prompt")).toHaveValue(new RegExp(observation.id));
+  await expect(page.locator("#agent-prompt")).toHaveValue(new RegExp(reportId));
+  await expect(page.locator("#agent-observation")).toContainText(observation.id);
+  await expect(page.locator("#agent-submit")).toBeDisabled();
+  expect(agentRequests).toEqual([]);
+  await card.locator('[data-action="dismiss"]').click();
+  await expect(page.locator("#observations-count")).toHaveText("0");
+  await expect(card).toBeHidden();
+  await page.reload();
+  await expect(page.locator("#observations-count")).toHaveText("0");
+  await page.locator("#observations-show-dismissed").check();
+  await expect(card).toBeVisible();
+  await expect(card).toContainText("Écartée");
+  await card.locator('[data-action="reopen"]').click();
+  await expect(page.locator("#observations-count")).toHaveText("1");
+  await page.reload();
+  await expect(card).toBeVisible();
+  await expect(card.locator('[data-action="investigate"]')).toHaveText("Ouvrir le rapport conservé");
+  const restored = await (await page.request.get(`/api/sessions/${session.id}/observations`)).json();
+  expect(restored.items).toHaveLength(1);
+  expect(restored.items[0].id).toBe(original.id);
+  expect(restored.items[0].evidence).toEqual(original.evidence);
+  await page.locator(".observations-panel").screenshot({ path: "test-results/observations-desktop.png" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.locator(".observations-panel").screenshot({ path: "test-results/observations-mobile.png" });
+  expect(errors).toEqual([]);
+  expect(agentRequests).toEqual([]);
+});
+
+test("an observation draft is linked only while its exact measurement window remains selected", async ({ page }) => {
+  const { session, observation } = await prepareObservationSession(page, "Question issue d’une observation · doublure");
+  const fixture = await installAgentUiDouble(page);
+  fixture.onStart = async (run) => {
+    run.status = "completed";
+    run.answer = "Doublure de protocole navigateur : aucun modèle appelé.";
+    run.ended_at = Date.now() / 1000;
+  };
+  await page.goto("/");
+  const card = page.locator(`[data-observation-id="${observation.id}"]`);
+  await card.locator('[data-action="agent"]').click();
+  expect(fixture.requests).toHaveLength(0);
+  await page.locator("#agent-submit").click();
+  await expect.poll(() => fixture.requests.length).toBe(1);
+  expect(fixture.requests[0]).toMatchObject({ sessionId: session.id, body: {
+    observation_id: observation.id, start_s: observation.start_s, end_s: observation.end_s,
+  } });
+  await expect(page.locator("#agent-submit")).toBeEnabled();
+  await page.locator("#window-start").fill("0");
+  await page.locator("#window-form").getByRole("button", { name: "Appliquer" }).click();
+  await expect(page.locator("#agent-observation")).toBeHidden();
+  await page.locator("#agent-prompt").fill("Une autre question portant sur la fenêtre élargie.");
+  await page.locator("#agent-submit").click();
+  await expect.poll(() => fixture.requests.length).toBe(2);
+  expect(fixture.requests[1].body).not.toHaveProperty("observation_id");
+});
+
+test("a delayed observation investigation preserves navigation and stale polls cannot undo dismissal", async ({ page }) => {
+  const { session: first, observation } = await prepareObservationSession(page, "Observation avec réponse retardée");
+  const { session: second } = await prepareExperimentReference(page, "Session conservée pendant l’investigation locale");
+  let release;
+  let received = false;
+  const gate = new Promise((resolve) => { release = resolve; });
+  await page.route(`**/api/sessions/${first.id}/observations/${observation.id}/investigate`, async (route) => {
+    const response = await route.fetch();
+    received = true;
+    await gate;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.goto("/");
+    await page.locator(".session-item").filter({ hasText: first.name }).click();
+    const card = page.locator(`[data-observation-id="${observation.id}"]`);
+    await card.locator('[data-action="investigate"]').click();
+    await expect.poll(() => received).toBe(true);
+    await page.locator(".session-item").filter({ hasText: second.name }).click();
+    const pending = page.waitForResponse((response) => response.url().endsWith(`/${observation.id}/investigate`));
+    release();
+    await pending;
+    await expect(page.locator("#active-session-title")).toHaveText(second.name);
+    await expect(page.locator("#observations-count")).toHaveText("0");
+    await page.locator(".session-item").filter({ hasText: first.name }).click();
+    await expect(card.locator('[data-action="investigate"]')).toHaveText("Ouvrir le rapport conservé");
+
+    let releasePoll;
+    let held = false;
+    const pollGate = new Promise((resolve) => { releasePoll = resolve; });
+    await page.route(`**/api/sessions/${first.id}/observations`, async (route) => {
+      if (held || route.request().method() !== "GET") return route.fallback();
+      const response = await route.fetch();
+      held = true;
+      await pollGate;
+      await route.fulfill({ response });
+    });
+    try {
+      await expect.poll(() => held).toBe(true);
+      await card.locator('[data-action="dismiss"]').click();
+      await expect(page.locator("#observations-count")).toHaveText("0");
+      const stale = page.waitForResponse((response) => response.url().endsWith(`/${first.id}/observations`));
+      releasePoll();
+      await stale;
+      await expect(page.locator("#observations-count")).toHaveText("0");
+      await expect(card).toBeHidden();
+    } finally { releasePoll(); }
+  } finally { release(); }
+});
+
+test("observation UI protocol fixture exposes scan backlog, omitted intervals and monitor failure", async ({ page }) => {
+  const { session } = await prepareExperimentReference(page, "Progression du repérage · doublure de protocole");
+  const fixture = {
+    items: [],
+    scan: { last_seq: 100, last_sample_seq: 1200, complete: false, omitted_gap_count: 7 },
+    monitor: {
+      available: false,
+      max_per_session: 20,
+      last_error: "Repérage temporairement indisponible · doublure de protocole.",
+    },
+  };
+  await page.route(`**/api/sessions/${session.id}/observations`, (route) =>
+    route.fulfill({ json: fixture }),
+  );
+  await page.goto("/");
+  await expect(page.locator("#observations-scan")).toContainText("échantillon #100 sur #1200");
+  await expect(page.locator("#observations-scan")).toContainText("7 intervalle(s) supplémentaire(s) non conservé(s)");
+  await expect(page.locator("#observations-scan")).toContainText("Suivi automatique indisponible");
+  await expect(page.locator("#observations-empty")).toContainText("en cours");
+  fixture.scan.complete = true;
+  fixture.scan.last_seq = 1200;
+  fixture.monitor.available = true;
+  fixture.monitor.last_error = null;
+  await expect(page.locator("#observations-scan")).toContainText("parcourues jusqu’à l’échantillon #1200");
+  await expect(page.locator("#observations-scan")).not.toContainText("indisponible");
+  await expect(page.locator("#observations-scan")).toContainText("7 intervalle(s) supplémentaire(s)");
+});

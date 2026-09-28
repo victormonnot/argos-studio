@@ -16,6 +16,7 @@ export function initAgent(hooks) {
   const path = (sessionId, runId = "", suffix = "") =>
     `/api/sessions/${encodeURIComponent(sessionId)}/agent-runs${runId ? `/${encodeURIComponent(runId)}` : ""}${suffix}`;
   const drafts = new Map();
+  const observationDrafts = new Map();
   let configuration = null;
   let sessionRevision = 0;
   let selectionRevision = 0;
@@ -71,6 +72,14 @@ export function initAgent(hooks) {
     text(
       "agent-window",
       `Fenêtre demandée : ${state.start === null ? "début de session" : seconds(state.start)} → ${state.end === null ? "dernière observation au lancement" : seconds(state.end)}. La fenêtre est figée au lancement ; les résultats des outils sont conservés.`,
+    );
+    const observation = observationDrafts.get(state.id);
+    $("agent-observation").hidden = !observation;
+    text(
+      "agent-observation",
+      observation
+        ? `Demande préparée depuis l’observation ${observation.id}. Aucun appel au modèle n’a encore été lancé par cette préparation.`
+        : "",
     );
     $("agent-submit").disabled =
       !configured || !state.detail || submitting || Boolean(active);
@@ -157,6 +166,7 @@ export function initAgent(hooks) {
     loading = false;
     $("agent-detail").hidden = true;
     $("agent-prompt").value = drafts.get(getState().id) ?? "";
+    windowChanged();
     status("Chargement des investigations de l’agent…");
     history();
     await list(getState().id, revision, true);
@@ -300,7 +310,7 @@ export function initAgent(hooks) {
     text(
       "agent-run-window",
       window
-        ? `Fenêtre conservée : ${seconds(window.start_s)} → ${seconds(window.end_s)}.`
+        ? `Fenêtre conservée : ${seconds(window.start_s)} → ${seconds(window.end_s)}.${run.context?.observation_id ? ` Observation d’origine : ${run.context.observation_id}.` : ""}`
         : "Fenêtre conservée dans le contexte de l’investigation.",
     );
     text("agent-run-prompt", run.prompt);
@@ -449,6 +459,33 @@ export function initAgent(hooks) {
   $("agent-prompt").addEventListener("input", () =>
     drafts.set(getState().id, $("agent-prompt").value),
   );
+  function windowChanged() {
+    const state = getState();
+    const observation = observationDrafts.get(state.id);
+    if (
+      observation &&
+      (state.start !== observation.start_s || state.end !== observation.end_s)
+    )
+      observationDrafts.delete(state.id);
+    sync();
+  }
+
+  async function prepareObservation(observation) {
+    if (getState().id !== observation.session_id) return;
+    const revision = sessionRevision;
+    await hooks.setWindow(observation.start_s, observation.end_s);
+    if (revision !== sessionRevision) return;
+    const state = getState();
+    if (state.start !== observation.start_s || state.end !== observation.end_s)
+      return;
+    const prompt = `Examine l’observation ${observation.id} : intervalle de réception de ${observation.duration_s} s entre les échantillons #${observation.before_seq} et #${observation.after_seq}, de ${observation.start_s} à ${observation.end_s} s.${observation.investigation_id ? ` Consulte le rapport conservé ${observation.investigation_id}.` : ""} Appuie tes conclusions sur les preuves de cette fenêtre, distingue les hypothèses des faits et propose la prochaine vérification utile.`;
+    observationDrafts.set(state.id, observation);
+    drafts.set(state.id, prompt);
+    $("agent-prompt").value = prompt;
+    sync();
+    $("agent-title").scrollIntoView({ block: "start" });
+    $("agent-prompt").focus({ preventScroll: true });
+  }
   $("agent-history").addEventListener("change", () =>
     select($("agent-history").value),
   );
@@ -473,6 +510,8 @@ export function initAgent(hooks) {
     const revision = sessionRevision;
     const selection = ++selectionRevision;
     const generation = state.generation;
+    windowChanged();
+    const observation = observationDrafts.get(sessionId);
     submitting = true;
     activeError = "";
     mutationRevision += 1;
@@ -484,6 +523,7 @@ export function initAgent(hooks) {
         prompt,
         start_s: state.start,
         end_s: state.end,
+        ...(observation ? { observation_id: observation.id } : {}),
       });
       if (run.status === "running")
         active = { id: run.id, session_id: sessionId };
@@ -547,5 +587,5 @@ export function initAgent(hooks) {
       healthPolling = false;
     }
   }, 5000);
-  return { selectionChanged, sync, syncHealth };
+  return { selectionChanged, sync, syncHealth, prepareObservation, windowChanged };
 }

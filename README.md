@@ -11,6 +11,7 @@ proposed checks across sessions. A bounded synthetic experiment can compare an
 unperturbed control with a deliberate interruption. The interface is currently
 in French; source code and technical documentation are in English. An optional
 agent can use the same instruments and retain an inspectable trace of its work.
+An automatic local observation queue keeps receipt gaps available for review.
 
 ## Run locally
 
@@ -65,6 +66,44 @@ scheduling and sample cadence also contribute to that interval.
 Gap analysis describes received data. It does not identify a network fault,
 count lost packets or establish sensor-to-display latency. The same analysis
 functions serve synthetic sessions, live MAVLink reception and imported recordings.
+
+## Review automatically detected observations
+
+The **À examiner** panel retains receipt intervals greater than 0.25 seconds
+between two adjacent samples. Discovery runs locally in the background for live
+sessions, imports and saved recordings. It does not contact a model. After a
+reception interruption, a new sample must arrive before the gap can be bounded
+and recorded; leading or trailing silence is not turned into a two-sample gap.
+Live freshness indicators remain available while reception is silent.
+
+Each observation freezes the actual sample pair, receipt-time window, duration,
+source and rule version. Its creation time is the time of discovery, including
+when an older recording is first scanned. The threshold is an inspection rule,
+not a vehicle requirement or diagnosis. Deliberately generated interruptions are
+also observations; the linked investigation can examine their recorded context.
+
+Use an observation to reopen its exact measurement window, investigate it locally,
+or prepare a question for the agent. Local investigation reuses the existing
+deterministic tools and atomically links one saved report to that observation.
+Repeating the action reopens the report. Dismiss an observation to remove it from
+the pending list; it remains available for review and can be reopened. Reloads,
+restarts and repeated scans preserve these choices without duplicating the evidence.
+
+Preparing an agent question fills its form and selects the evidence window; sending
+it remains a separate explicit action with the configured provider. The request
+retains the originating observation ID. On that same window, the agent's
+investigation tool creates or reuses the linked report. Changing the selected
+window before submission removes the association so another window is not
+misrepresented as the original observation. Questions and deterministic reports
+remain usable independently of this queue.
+
+Discovery polls once per second and scans at most 2,000 new samples per session
+per pass. Cursors are persisted with each batch so restarts resume the remaining
+work. The queue retains the first 20 detected gaps per session; subsequent gaps
+are counted as omitted, and remain inspectable through the complete-window
+analysis. The interface distinguishes pending scanning, truncation and temporary
+scanner failures from an absence of detected gaps. This is local event discovery
+and assisted investigation, not autonomous model reasoning or physical monitoring.
 
 ## Investigate reception
 
@@ -317,7 +356,8 @@ capture date is retained as metadata without assuming clock synchronization.
 ## Data and limits
 
 Data is stored in the ignored `.data/` directory by default: a SQLite database
-for sessions, samples, events, investigations, experiments, agent traces and raw UDP datagrams,
+for sessions, samples, events, observations, investigations, experiments, agent traces
+and raw UDP datagrams,
 and `recordings/` for imported originals.
 `ARGOS_STUDIO_DATA_DIR` also selects the directory. An interrupted acquisition is
 retained and marked as interrupted when the application restarts. Earlier Studio
@@ -342,6 +382,7 @@ the separate capture export includes every retained datagram's bytes.
 | Experiment proposals per originating session | 20; protocol up to 64 KiB, result up to 4 MiB |
 | Synthetic experiment | Two 6-second captures; 20-second execution deadline; 10-minute proposal expiry |
 | Agent history per session | 50 requests, up to 32 trace steps of 64 KiB each; final text up to 16,000 characters |
+| Local observations | 20 receipt gaps per session; 2,000 new samples per session per scan |
 
 There is no automatic deletion or total disk quota. When the session limit is
 reached, retain the existing directory and start with another data directory.
@@ -366,6 +407,7 @@ integrated UAV Debugger/Meridian modules are outside this version.
 | [`agent.py`](src/argos_studio/agent.py) | Bound provider/tool calls, cancellation and persistent execution traces |
 | [`agent_tools.py`](src/argos_studio/agent_tools.py) | Strict session-scoped access to existing instruments and evidence |
 | [`agent_provider.py`](src/argos_studio/agent_provider.py) | Opt-in OpenAI Responses adapter with server-side credentials |
+| [`observations.py`](src/argos_studio/observations.py) | Incremental local discovery and evidence-linked investigation |
 | [`app.py`](src/argos_studio/app.py) | Local FastAPI endpoints, process ownership and HTTP boundaries |
 | [`argos_import.py`](src/argos_studio/argos_import.py) | Optional subprocess adapter to ARGOS's native recording reader |
 | [`static/`](src/argos_studio/static/) | Browser interface, charts, timeline and replay without a build step |
@@ -382,6 +424,10 @@ and response routes. Key endpoints are:
 | `POST /api/sessions/{id}/annotations` | Attach an observation to a session time |
 | `POST /api/sessions/{id}/dropout` / `stop` | Interrupt synthetic reception or stop the active acquisition |
 | `GET /api/sessions/{id}/analysis` | Evidence for a selected reception-time window |
+| `GET /api/sessions/{id}/observations` | Retained observations, scan progress and omitted gap count |
+| `GET /api/sessions/{id}/observations/{observation_id}` | Exact frozen sample pair and linked report |
+| `POST /api/sessions/{id}/observations/{observation_id}/investigate` | Create or reopen its deterministic investigation |
+| `POST /api/sessions/{id}/observations/{observation_id}/dismiss` / `reopen` | Change review disposition without modifying evidence |
 | `GET` / `POST /api/sessions/{id}/investigations` | List reports or investigate a window with optional context |
 | `GET /api/sessions/{id}/investigations/{report_id}` | Read a saved report; append `/export` to download JSON |
 | `POST /api/sessions/{id}/investigations/{report_id}/experiments` | Prepare the fixed synthetic comparison protocol |

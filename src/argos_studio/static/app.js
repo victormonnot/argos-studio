@@ -1,4 +1,5 @@
 import { initAgent } from "./agent.js";
+import { initObservations } from "./observations.js";
 
 const $ = (id) => document.getElementById(id);
 const state = {
@@ -279,6 +280,7 @@ async function selectSession(id) {
     refreshSelection(),
     loadInvestigations(id, state.investigationSessionRevision, true),
     agentWorkspace.selectionChanged(),
+    observationWorkspace.selectionChanged(),
   ]);
 }
 async function refreshSelection() {
@@ -755,6 +757,7 @@ async function setWindow(start, end) {
   clearError();
   state.start = start;
   state.end = end;
+  agentWorkspace.windowChanged();
   state.generation += 1;
   state.follow = true;
   $("window-start").value = start === null ? "" : String(start);
@@ -965,6 +968,22 @@ const agentWorkspace = initAgent({
     state.id
       ? loadInvestigations(state.id, state.investigationSessionRevision)
       : Promise.resolve(),
+});
+const observationWorkspace = initObservations({
+  getState: () => state,
+  api,
+  post,
+  element,
+  seconds,
+  sourceLabel,
+  setWindow,
+  selectInvestigation,
+  reloadInvestigations: () =>
+    state.id
+      ? loadInvestigations(state.id, state.investigationSessionRevision)
+      : Promise.resolve(),
+  prepareObservation: (observation) =>
+    agentWorkspace.prepareObservation(observation),
 });
 
 async function initialize() {
