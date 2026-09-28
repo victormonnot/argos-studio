@@ -7,7 +7,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -15,9 +15,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .acquisition import Acquisition
 from .argos_import import read_argos_recording
 from .core import Store
-from .simulator import Simulator
+from .mavlink import MAX_DATAGRAMS, MAX_RAW_BYTES, MAX_SAMPLES, dialect
 
 MAX_IMPORT_BYTES = 10 * 1024 * 1024
 MAX_SESSIONS = 100
@@ -58,6 +59,10 @@ class StartSession(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=120)
     objective: str = Field(default="", max_length=2000)
+    source: Literal["simulation", "mavlink-udp"] = "simulation"
+    listen_port: int = Field(default=14580, ge=1024, le=65535, strict=True)
+    system_id: int = Field(default=1, ge=1, le=255, strict=True)
+    component_id: int = Field(default=1, ge=1, le=255, strict=True)
 
 
 class Annotation(BaseModel):
@@ -85,7 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ) from exc
             store = Store(settings.data_dir / "studio.sqlite3")
             store.recover_interrupted()
-            runtime = Simulator(
+            runtime = Acquisition(
                 store,
                 period_s=settings.period_s,
                 max_duration_s=settings.max_duration_s,
@@ -166,6 +171,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "ARGOS_STUDIO_ARGOS_PYTHON au lancement."
                 ),
             },
+            "mavlink": {
+                "available": not bool(dialect.MAVLINK_IGNORE_CRC),
+                "listen_host": "127.0.0.1",
+                "default_port": 14580,
+                "read_only": True,
+                "max_raw_bytes": MAX_RAW_BYTES,
+                "max_datagrams": MAX_DATAGRAMS,
+                "max_samples": MAX_SAMPLES,
+            },
             "limits": {
                 "max_duration_s": settings.max_duration_s,
                 "max_import_bytes": MAX_IMPORT_BYTES,
@@ -181,7 +195,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def start_session(body: StartSession):
         async with app.state.creation_lock:
             capacity()
-            return await app.state.runtime.start(body.name, body.objective)
+            return await app.state.runtime.start(**body.model_dump())
 
     @app.get("/api/sessions/{session_id}")
     def session_snapshot(session_id: str, start_s: Bound = None, end_s: Bound = None):
@@ -237,6 +251,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             path, media_type="application/octet-stream", filename=f"{session['id']}.jsonl"
         )
 
+    @app.get("/api/sessions/{session_id}/capture")
+    def export_capture(session_id: str):
+        session = app.state.store.get_session(session_id)
+        if session["source"] != "mavlink-udp":
+            raise HTTPException(404, "Cette session ne possède pas de capture UDP.")
+        if session["status"] == "live":
+            raise HTTPException(409, "Arrêtez la réception avant d’exporter la capture brute.")
+        payload = {
+            "schema_version": 1,
+            "session": session,
+            "capture": app.state.store.capture_summary(session_id),
+            "datagrams": app.state.store.datagrams(session_id),
+        }
+        return Response(
+            json.dumps(payload, ensure_ascii=False, allow_nan=False),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="argos-capture-{session_id}.json"',
+            },
+        )
+
     @app.post("/api/import/argos", status_code=201)
     async def import_argos(request: Request, filename: str = "ARGOS recording"):
         if not settings.import_available():
@@ -250,7 +285,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             capacity()
             if app.state.runtime.active:
                 raise HTTPException(
-                    409, "Arrêtez la simulation avant d’importer un enregistrement."
+                    409, "Arrêtez l’acquisition avant d’importer un enregistrement."
                 )
             result = await asyncio.to_thread(
                 read_argos_recording,

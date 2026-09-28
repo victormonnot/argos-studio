@@ -66,9 +66,82 @@
         <section class="start-panel" aria-labelledby="start-title">
           <div class="start-description">
             <h2 id="start-title">Nouvelle session</h2>
-            <p>Source synthétique · un véhicule · 3 min maximum</p>
+            <p id="source-description">
+              Source synthétique · un véhicule · 3 min maximum
+            </p>
           </div>
           <form id="start-form" class="start-form">
+            <div class="source-settings">
+              <div class="source-choice">
+                <label for="source-kind"
+                  >Source
+                  <select id="source-kind" name="source">
+                    <option value="simulation">Simulation synthétique</option>
+                    <option value="mavlink-udp">
+                      MAVLink local · SITL déclaré
+                    </option>
+                  </select>
+                </label>
+                <p id="source-help">
+                  Signal synthétique de développement, sans physique
+                  d’autopilote.
+                </p>
+              </div>
+              <fieldset
+                id="mavlink-settings"
+                class="mavlink-settings"
+                hidden
+                disabled
+              >
+                <legend>Réception passive locale</legend>
+                <label
+                  >Adresse d’écoute<input
+                    id="listen-host"
+                    value="127.0.0.1"
+                    readonly
+                    aria-readonly="true"
+                /></label>
+                <label
+                  >Port UDP<input
+                    id="listen-port"
+                    name="listen_port"
+                    type="number"
+                    min="1024"
+                    max="65535"
+                    step="1"
+                    value="14580"
+                    required
+                /></label>
+                <label
+                  >Système attendu<input
+                    id="system-id"
+                    name="system_id"
+                    type="number"
+                    min="1"
+                    max="255"
+                    step="1"
+                    value="1"
+                    required
+                /></label>
+                <label
+                  >Composant attendu<input
+                    id="component-id"
+                    name="component_id"
+                    type="number"
+                    min="1"
+                    max="255"
+                    step="1"
+                    value="1"
+                    required
+                /></label>
+                <p class="source-declaration">
+                  Origine déclarée : simulation SITL. Une adresse locale ne
+                  prouve pas l’origine du flux ; aucune authentification du
+                  véhicule n’est effectuée. Le Studio écoute uniquement et
+                  n’envoie aucune commande.
+                </p>
+              </fieldset>
+            </div>
             <label
               >Nom<input
                 id="session-name"
@@ -94,12 +167,12 @@
           <div class="empty-graphic" aria-hidden="true">⌁</div>
           <h2>Une première mesure change tout.</h2>
           <p>
-            Démarrez une session synthétique. Le flux est enregistré au fil de
-            l’essai ; vous pourrez l’annoter, provoquer une interruption et
-            consulter ses traces après l’arrêt.
+            Démarrez une source synthétique ou écoutez un flux MAVLink local.
+            Les mesures sont enregistrées au fil de l’essai ; vous pourrez les
+            annoter et retrouver leurs traces après l’arrêt.
           </p>
           <p class="muted">
-            Aucun matériel connecté. Aucun modèle de langage actif.
+            Réception passive uniquement. Aucun modèle de langage actif.
           </p>
         </section>
         <section
@@ -118,8 +191,17 @@
             </div>
             <div class="session-actions">
               <button id="export-button" class="button subtle" type="button">
-                Exporter</button
-              ><button id="stop-button" class="button danger" type="button">
+                Exporter
+              </button>
+              <button
+                id="capture-button"
+                class="button subtle"
+                type="button"
+                hidden
+              >
+                Capture brute
+              </button>
+              <button id="stop-button" class="button danger" type="button">
                 Arrêter la session
               </button>
             </div>
@@ -141,6 +223,73 @@
                     ><span id="freshness-text">En attente</span>
                   </div>
                 </div>
+                <section
+                  id="receiver-panel"
+                  class="receiver-panel"
+                  aria-labelledby="receiver-title"
+                  hidden
+                >
+                  <div class="receiver-heading">
+                    <h4 id="receiver-title">Réception MAVLink</h4>
+                    <span id="receiver-status" class="receiver-status"
+                      >En attente</span
+                    >
+                  </div>
+                  <dl class="receiver-details">
+                    <div>
+                      <dt>Écoute locale</dt>
+                      <dd id="receiver-endpoint">—</dd>
+                    </div>
+                    <div>
+                      <dt>Identité attendue</dt>
+                      <dd id="receiver-identity">—</dd>
+                    </div>
+                    <div>
+                      <dt>Émetteur retenu</dt>
+                      <dd id="receiver-peer">—</dd>
+                    </div>
+                    <div>
+                      <dt>Dernier HEARTBEAT</dt>
+                      <dd id="heartbeat-age">—</dd>
+                    </div>
+                  </dl>
+                  <p class="receiver-note">
+                    Le HEARTBEAT décrit la présence de la source ; la fraîcheur
+                    des mesures d’attitude est affichée séparément.
+                  </p>
+                  <details
+                    id="heartbeat-details"
+                    class="heartbeat-details"
+                    hidden
+                  >
+                    <summary>Champs du dernier HEARTBEAT observé</summary>
+                    <pre id="heartbeat-fields"></pre>
+                  </details>
+                  <div
+                    class="receipt-quality"
+                    aria-label="Qualité des réceptions"
+                  >
+                    <div>
+                      <span>Datagrammes</span
+                      ><strong id="capture-count">0</strong>
+                    </div>
+                    <div>
+                      <span>Acceptés</span
+                      ><strong id="capture-accepted">0</strong>
+                    </div>
+                    <div>
+                      <span>Invalides / signés</span
+                      ><strong id="capture-rejected">0 / 0</strong>
+                    </div>
+                    <div>
+                      <span>Autre identité / émetteur</span
+                      ><strong id="capture-foreign">0 / 0</strong>
+                    </div>
+                  </div>
+                  <p id="capture-size" class="receiver-note">
+                    Aucun datagramme conservé.
+                  </p>
+                </section>
                 <p id="measurement-context" class="measurement-context">
                   Aucune mesure
                 </p>
@@ -310,7 +459,7 @@
                   <ul id="analysis-limitations"></ul>
                 </details>
               </section>
-              <section class="panel experiment-panel">
+              <section id="experiment-panel" class="panel experiment-panel">
                 <p class="eyebrow">ESSAI CONTRÔLÉ</p>
                 <h3>Interrompre la réception</h3>
                 <p>

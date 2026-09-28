@@ -1319,3 +1319,200 @@ summary {
 .measurement-context.historical {
   color: var(--amber);
 }
+
+/* Source selection shares the session form; it never enables vehicle commands. */
+.start-form {
+  flex-wrap: wrap;
+}
+.source-settings {
+  flex-basis: 100%;
+  min-width: 0;
+  padding-bottom: 4px;
+}
+.source-choice {
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+}
+.start-form .source-choice label {
+  width: 265px;
+  flex-shrink: 0;
+}
+.source-choice p {
+  margin: 0 0 7px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+}
+select {
+  border: 1px solid #2b3948;
+  border-radius: 5px;
+  background: #0d151f;
+  color: #e3edf5;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 12px;
+  min-width: 0;
+  width: 100%;
+  cursor: pointer;
+  outline-offset: 4px;
+}
+select:focus-visible {
+  outline: 2px solid var(--teal);
+}
+select:disabled {
+  opacity: 0.43;
+  cursor: not-allowed;
+}
+.mavlink-settings {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 1fr;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  margin: 16px 0 0;
+  padding: 13px;
+  min-width: 0;
+}
+.mavlink-settings legend {
+  color: #a2b8c8;
+  padding: 0 7px;
+  font-size: 10px;
+}
+.start-form .mavlink-settings label {
+  width: 100%;
+  line-height: 1.6;
+}
+.mavlink-settings input[readonly] {
+  color: var(--muted);
+}
+.source-declaration {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+}
+.receiver-panel {
+  margin: 18px 20px 0;
+  padding: 14px;
+  background: #101a25;
+  border: 1px solid #2c3d4d;
+  border-radius: 5px;
+}
+.receiver-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.receiver-heading h4 {
+  margin: 0;
+  color: #d2deea;
+  font-size: 11px;
+  font-weight: 500;
+}
+.receiver-status {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.6;
+}
+.receiver-status.receiving {
+  color: var(--teal);
+}
+.receiver-status.stale,
+.receiver-status.unavailable {
+  color: var(--amber);
+}
+.receiver-details {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px 20px;
+  margin: 17px 0 0;
+}
+.receiver-details dt {
+  color: var(--muted);
+  font-size: 9px;
+}
+.receiver-details dd {
+  margin: 5px 0 0;
+  font:
+    10px ui-monospace,
+    monospace;
+  line-height: 1.6;
+  color: #c2d1df;
+  overflow-wrap: anywhere;
+}
+.receiver-note {
+  color: #8396a6;
+  font-size: 9px;
+  line-height: 1.7;
+  margin: 13px 0 0;
+}
+.heartbeat-details {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.7;
+  margin-top: 10px;
+}
+.heartbeat-details pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 9px;
+}
+.receipt-quality {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  margin-top: 14px;
+  padding-top: 13px;
+}
+.receipt-quality span {
+  display: block;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.7;
+  min-height: 28px;
+}
+.receipt-quality strong {
+  display: block;
+  color: #c8d6e3;
+  font:
+    12px ui-monospace,
+    monospace;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 700px) {
+  .source-choice {
+    display: block;
+  }
+  .start-form .source-choice label {
+    width: 100%;
+  }
+  .source-choice p {
+    margin: 8px 0 0;
+  }
+  .mavlink-settings {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    padding: 11px;
+  }
+  .receiver-panel {
+    margin-left: 14px;
+    margin-right: 14px;
+    padding: 12px;
+  }
+  .receiver-details {
+    gap: 12px;
+  }
+  .receipt-quality {
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  .receipt-quality span {
+    min-height: 0;
+  }
+}

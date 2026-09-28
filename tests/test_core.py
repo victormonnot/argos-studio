@@ -1,5 +1,7 @@
 """Persistence, evidence boundaries, and atomicity of session storage."""
 
+import base64
+import json
 import math
 import sqlite3
 import tempfile
@@ -10,6 +12,29 @@ from pathlib import Path
 from unittest.mock import patch
 
 from argos_studio.core import Store
+
+LEGACY_SCHEMA = """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, objective TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('simulation','argos-recording')),
+    status TEXT NOT NULL CHECK(status IN ('live','completed','interrupted')),
+    metadata TEXT NOT NULL, created_at REAL NOT NULL, ended_at REAL,
+    elapsed_s REAL NOT NULL DEFAULT 0 CHECK(elapsed_s >= 0)
+);
+CREATE UNIQUE INDEX one_live_simulation ON sessions(source)
+    WHERE source='simulation' AND status='live';
+CREATE TABLE samples (
+    id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+    seq INTEGER NOT NULL, source_time_s REAL NOT NULL, elapsed_s REAL NOT NULL,
+    received_at REAL NOT NULL, roll_deg REAL, pitch_deg REAL, gyro_x_deg_s REAL,
+    UNIQUE(session_id,seq)
+);
+CREATE INDEX sample_window ON samples(session_id,elapsed_s);
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+    kind TEXT NOT NULL, at_s REAL NOT NULL, text TEXT NOT NULL, created_at REAL NOT NULL
+);
+"""
 
 
 def sample(elapsed_s=0.0, roll_deg=1.0, **overrides):
@@ -25,6 +50,20 @@ def sample(elapsed_s=0.0, roll_deg=1.0, **overrides):
     return result
 
 
+def datagram(elapsed_s=0.0, **overrides):
+    result = {
+        "elapsed_s": elapsed_s,
+        "received_at": 2000 + elapsed_s,
+        "peer_host": "127.0.0.1",
+        "peer_port": 14580,
+        "payload": b"\xfe\x00\xff\x01",
+        "disposition": "accepted",
+        "details": {"frames": [{"type": "ATTITUDE", "system_id": 1, "component_id": 1}]},
+    }
+    result.update(overrides)
+    return result
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -34,6 +73,219 @@ class StoreTests(unittest.TestCase):
 
     def create(self):
         return self.store.create_session("Bench observation", "Inspect receipt continuity")
+
+    def test_legacy_migration_preserves_rows_references_and_session_statuses(self):
+        path = Path(self.directory.name) / "legacy.sqlite3"
+        with sqlite3.connect(path) as connection:
+            connection.executescript(LEGACY_SCHEMA)
+            connection.executemany(
+                "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        "recorded",
+                        "Recording",
+                        "Observe",
+                        "argos-recording",
+                        "completed",
+                        '{"clock":"monotonic"}',
+                        1,
+                        3,
+                        2,
+                    ),
+                    (
+                        "interrupted",
+                        "Simulation",
+                        "Observe",
+                        "simulation",
+                        "interrupted",
+                        "{}",
+                        4,
+                        None,
+                        2,
+                    ),
+                    ("live", "Active", "Observe", "simulation", "live", "{}", 5, None, 1),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO samples VALUES (?,?,?,?,?,?,?,?,?)",
+                (20, "recorded", 0, 112, 1, 42.75, 12, None, 0),
+            )
+            connection.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (31, "interrupted", "annotation", 2, "Existing note", 5),
+            )
+            before = {
+                table: connection.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+                for table in ("sessions", "samples", "events")
+            }
+        migrated = Store(path)
+        with migrated._connection() as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            for table, expected in before.items():
+                actual = connection.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+                self.assertEqual([tuple(row) for row in actual], expected)
+            for table in ("samples", "events"):
+                references = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+                self.assertEqual(references[0]["table"], "sessions")
+        self.assertEqual(migrated.get_session("interrupted")["status"], "interrupted")
+        self.assertEqual(migrated.get_session("live")["status"], "live")
+        self.assertEqual(migrated.recover_interrupted(), 1)
+        migrated.create_session("UDP", "Observe", source="mavlink-udp")
+        self.assertEqual(Store(path).get_session("recorded")["sample_count"], 1)
+
+    def test_failed_legacy_migration_rolls_back_schema_and_rows(self):
+        path = Path(self.directory.name) / "inconsistent-legacy.sqlite3"
+        with sqlite3.connect(path) as connection:
+            connection.executescript(LEGACY_SCHEMA)
+            connection.execute("INSERT INTO events VALUES (1,'missing','annotation',0,'Orphan',1)")
+        with self.assertRaisesRegex(ValueError, "foreign keys"):
+            Store(path)
+        with sqlite3.connect(path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
+            sql = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE name='sessions'"
+            ).fetchone()[0]
+            self.assertNotIn("mavlink-udp", sql)
+            self.assertIsNone(
+                connection.execute("SELECT 1 FROM sqlite_schema WHERE name='datagrams'").fetchone()
+            )
+
+    def test_simulation_and_mavlink_compete_for_one_active_acquisition(self):
+        barrier = threading.Barrier(2)
+
+        def start(source):
+            barrier.wait(timeout=5)
+            try:
+                return self.store.create_session("Source", "Observe", source=source)
+            except ValueError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(start, ["simulation", "mavlink-udp"]))
+        accepted = [result for result in results if result is not None]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(len(self.store.list_sessions()), 1)
+        self.store.finish_session(accepted[0]["id"])
+        other = "mavlink-udp" if accepted[0]["source"] == "simulation" else "simulation"
+        self.assertEqual(self.store.create_session("Next", "", source=other)["source"], other)
+
+    def test_datagrams_preserve_raw_bytes_clocks_and_sample_links_after_reopen(self):
+        session = self.store.create_session("UDP", "Inspect", source="mavlink-udp")
+        first = self.store.append_datagram(
+            session["id"], **datagram(1, samples=[sample(1), sample(1, roll_deg=5)])
+        )
+        second = self.store.append_datagram(session["id"], **datagram(2, samples=[sample(2)]))
+        self.assertEqual(first, {"seq": 0, "sample_start_seq": 0, "sample_count": 2})
+        self.assertEqual(second, {"seq": 1, "sample_start_seq": 2, "sample_count": 1})
+        reopened = Store(self.path)
+        rows = reopened.datagrams(session["id"])
+        self.assertEqual([row["seq"] for row in rows], [0, 1])
+        self.assertEqual(base64.b64decode(rows[0]["raw_base64"]), datagram()["payload"])
+        self.assertNotIn("payload", rows[0])
+        self.assertEqual(rows[0]["details"], datagram()["details"])
+        self.assertEqual(rows[0]["elapsed_s"], 1)
+        self.assertEqual(rows[0]["received_at"], 2001)
+        self.assertEqual(rows[0]["peer_host"], "127.0.0.1")
+        self.assertEqual(rows[0]["peer_port"], 14580)
+        self.assertEqual(len(reopened.samples(session["id"])), 3)
+        json.dumps(rows, allow_nan=False)
+        expected = {"datagram_count": 2, "raw_bytes": 8, "dispositions": {"accepted": 2}}
+        self.assertEqual(reopened.capture_summary(session["id"]), expected)
+        self.assertEqual(reopened.snapshot(session["id"])["capture"], expected)
+
+    def test_invalid_and_empty_datagrams_preserve_receipt_without_invented_samples(self):
+        session = self.store.create_session("UDP", "Inspect", source="mavlink-udp")
+        for index, disposition in enumerate(
+            ("invalid", "signed", "foreign_source", "foreign_peer"), start=1
+        ):
+            result = self.store.append_datagram(
+                session["id"], **datagram(index, payload=b"", disposition=disposition)
+            )
+            self.assertEqual(result["sample_count"], 0)
+            self.assertIsNone(result["sample_start_seq"])
+        self.assertEqual(self.store.get_session(session["id"])["elapsed_s"], 4)
+        self.assertEqual(self.store.samples(session["id"]), [])
+        self.assertEqual(self.store.analyze(session["id"])["duration_s"], 4)
+        summary = self.store.capture_summary(session["id"])
+        self.assertEqual(summary["datagram_count"], 4)
+        self.assertEqual(summary["raw_bytes"], 0)
+        self.assertEqual(summary["dispositions"]["invalid"], 1)
+
+    def test_loopback_alias_evidence_retains_actual_peer_address(self):
+        session = self.store.create_session("UDP", "Inspect", source="mavlink-udp")
+        self.store.append_datagram(session["id"], **datagram(0, samples=[sample(0)]))
+        self.store.append_datagram(
+            session["id"],
+            **datagram(1, peer_host="127.0.0.2", disposition="foreign_peer"),
+        )
+        rows = self.store.datagrams(session["id"])
+        self.assertEqual([row["peer_host"] for row in rows], ["127.0.0.1", "127.0.0.2"])
+        self.assertEqual(rows[1]["disposition"], "foreign_peer")
+        self.assertEqual(rows[1]["sample_count"], 0)
+        self.assertEqual(self.store.get_session(session["id"])["sample_count"], 1)
+
+    def test_failed_datagram_write_rolls_back_derived_samples_and_duration(self):
+        session = self.store.create_session("UDP", "Inspect", source="mavlink-udp")
+        with self.store._connection() as connection:
+            connection.execute(
+                "CREATE TRIGGER reject_datagram BEFORE INSERT ON datagrams "
+                "BEGIN SELECT RAISE(ABORT, 'test write failure'); END"
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.append_datagram(session["id"], **datagram(1, samples=[sample(1)]))
+        self.assertEqual(self.store.samples(session["id"]), [])
+        self.assertEqual(self.store.datagrams(session["id"]), [])
+        self.assertEqual(self.store.get_session(session["id"])["elapsed_s"], 0)
+        with self.store._connection() as connection:
+            connection.execute("DROP TRIGGER reject_datagram")
+        result = self.store.append_datagram(session["id"], **datagram(1, samples=[sample(1)]))
+        self.assertEqual(result["sample_start_seq"], 0)
+        self.assertEqual(result["seq"], 0)
+
+    def test_datagram_validation_and_session_boundaries(self):
+        simulation = self.create()
+        with self.assertRaises(ValueError):
+            self.store.append_datagram(simulation["id"], **datagram())
+        self.assertIsNone(self.store.snapshot(simulation["id"])["capture"])
+        self.store.finish_session(simulation["id"])
+        session = self.store.create_session("UDP", "Inspect", source="mavlink-udp")
+        invalid = [
+            {"elapsed_s": -1},
+            {"elapsed_s": math.nan},
+            {"received_at": math.inf},
+            {"peer_host": "0.0.0.0"},
+            {"peer_host": "localhost"},
+            {"peer_host": "128.0.0.1"},
+            {"peer_host": "::1"},
+            {"peer_host": "127.0.0.256"},
+            {"peer_host": "127.1"},
+            {"peer_host": "127.000.0.1"},
+            {"peer_host": 2130706433},
+            {"peer_port": 0},
+            {"peer_port": 65536},
+            {"peer_port": True},
+            {"payload": "bytes"},
+            {"payload": b"x" * 65536},
+            {"disposition": "unknown"},
+            {"details": {"bad": math.nan}},
+            {"details": {"large": "x" * 65536}},
+            {"samples": [sample(1)]},
+            {"samples": [sample(received_at=4000)]},
+            {"disposition": "invalid", "samples": [sample()]},
+        ]
+        for overrides in invalid:
+            with self.subTest(fields=list(overrides)), self.assertRaises(ValueError):
+                self.store.append_datagram(session["id"], **(datagram() | overrides))
+        self.assertEqual(self.store.capture_summary(session["id"])["datagram_count"], 0)
+        self.store.append_datagram(session["id"], **datagram(2))
+        with self.assertRaisesRegex(ValueError, "receipt order"):
+            self.store.append_datagram(session["id"], **datagram(1))
+        self.store.finish_session(session["id"])
+        with self.assertRaises(ValueError):
+            self.store.append_datagram(session["id"], **datagram(3))
 
     def test_session_samples_and_annotations_survive_reopen(self):
         session = self.store.create_session(
@@ -178,8 +430,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(result["events"], [event])
 
     def test_snapshot_remains_consistent_when_acquisition_writes_during_read(self):
-        session = self.create()
-        first = self.store.append_sample(session["id"], **sample(0))
+        session = self.store.create_session("UDP", "Observe", source="mavlink-udp")
+        self.store.append_datagram(session["id"], **datagram(0, samples=[sample(0)]))
+        first = self.store.samples(session["id"])[0]
         first_event = self.store.annotate(session["id"], "Initial observation", at_s=0)
         reader = Store(self.path)
         read_started = threading.Event()
@@ -200,7 +453,7 @@ class StoreTests(unittest.TestCase):
             future = executor.submit(reader.snapshot, session["id"])
             try:
                 self.assertTrue(read_started.wait(timeout=5))
-                self.store.append_sample(session["id"], **sample(1))
+                self.store.append_datagram(session["id"], **datagram(1, samples=[sample(1)]))
                 self.store.annotate(session["id"], "Concurrent observation", at_s=1)
                 self.store.finish_session(session["id"], elapsed_s=2)
             finally:
@@ -214,10 +467,14 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(result["events"], [first_event])
         self.assertEqual(result["analysis"]["sample_count"], 1)
         self.assertEqual(result["analysis"]["duration_s"], 0)
+        self.assertEqual(result["capture"]["datagram_count"], 1)
+        self.assertEqual(result["capture"]["raw_bytes"], 4)
         current = self.store.snapshot(session["id"])
         self.assertEqual(current["session"]["status"], "completed")
         self.assertEqual(current["session"]["sample_count"], 2)
         self.assertEqual(len(current["events"]), 2)
+        self.assertEqual(current["capture"]["datagram_count"], 2)
+        self.assertEqual(current["capture"]["raw_bytes"], 8)
 
     def test_bulk_append_rolls_back_all_records_on_invalid_order(self):
         session = self.create()
@@ -310,6 +567,9 @@ class StoreTests(unittest.TestCase):
             lambda: self.store.annotate("missing", "Text", 0),
             lambda: self.store.finish_session("missing"),
             lambda: self.store.append_sample("missing", **sample()),
+            lambda: self.store.append_datagram("missing", **datagram()),
+            lambda: self.store.datagrams("missing"),
+            lambda: self.store.capture_summary("missing"),
         ]
         for method in methods:
             with self.subTest(method=method), self.assertRaises(KeyError):

@@ -1,5 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { createSocket } from "node:dgram";
 
 test("capture, mark, interrupt, inspect evidence, export and replay", async ({
   page,
@@ -117,4 +119,174 @@ test("live telemetry recovers after a temporary connection failure", async ({
   await expect(page.locator("#error-message")).toBeHidden();
   await page.locator("#stop-button").click();
   await expect(page.locator("#stop-button")).toBeHidden();
+});
+
+async function unusedLoopbackPort() {
+  const socket = createSocket("udp4");
+  try {
+    await new Promise((resolve, reject) => {
+      socket.once("error", reject);
+      socket.bind(0, "127.0.0.1", resolve);
+    });
+    return socket.address().port;
+  } finally {
+    socket.close();
+  }
+}
+
+test("passive MAVLink waits, receives, ages and preserves capture for replay", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const port = await unusedLoopbackPort();
+  let sender;
+  let finished;
+  let sessionId;
+  try {
+    await page.goto("/");
+    await expect(
+      page.locator('#source-kind option[value="mavlink-udp"]'),
+    ).toBeEnabled();
+    await page.locator("#source-kind").selectOption("mavlink-udp");
+    await expect(page.locator("#mavlink-settings")).toBeVisible();
+    await expect(page.locator("#listen-host")).toHaveValue("127.0.0.1");
+    await page.locator("#listen-port").fill(String(port));
+    await page
+      .locator("#session-name")
+      .fill("MAVLink synthétique via UDP local");
+    await page
+      .locator("#session-objective")
+      .fill(
+        "Conserver les réceptions et distinguer écoute, présence et fraîcheur ATTITUDE",
+      );
+    await page.locator("#start-button").click();
+    await expect(page.locator("#source-badge")).toHaveText("MAVLink UDP");
+    await expect(page.locator("#receiver-status")).toHaveText(
+      "Écoute ouverte · en attente",
+    );
+    await expect(page.locator("#receiver-identity")).toHaveText(
+      "Système 1 · composant 1",
+    );
+    await expect(page.locator("#heartbeat-age")).toHaveText("Jamais observé");
+    await expect(page.locator("#sample-value")).toHaveText("0");
+    await expect(page.locator("#experiment-panel")).toBeHidden();
+    await expect(page.locator("#capture-button")).toBeDisabled();
+    await expect(page.locator("#source-notice")).toContainText(
+      "non authentifiée",
+    );
+    const sessions = await (await page.request.get("/api/sessions")).json();
+    sessionId = sessions.find((session) => session.status === "live").id;
+
+    sender = spawn(
+      ".venv/bin/python",
+      [
+        "tests/browser/emit_mavlink.py",
+        "--port",
+        String(port),
+        "--duration",
+        "2",
+      ],
+      {
+        env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let stderr = "";
+    sender.stderr.on("data", (data) => {
+      stderr += data;
+    });
+    finished = new Promise((resolve) => {
+      sender.once("error", (error) =>
+        resolve({ code: -1, error: error.message }),
+      );
+      sender.once("close", (code) => resolve({ code, error: stderr }));
+    });
+    await expect(page.locator("#receiver-status")).toHaveText(
+      "Réception en cours",
+    );
+    await expect(page.locator("#freshness-text")).toContainText(
+      "ATTITUDE reçue",
+    );
+    await expect(page.locator("#heartbeat-age")).toContainText("Reçu il y a");
+    await expect(page.locator("#receiver-peer")).toContainText("127.0.0.1:");
+    await expect
+      .poll(async () =>
+        Number(await page.locator("#sample-value").textContent()),
+      )
+      .toBeGreaterThan(5);
+    await expect(page.locator("#capture-rejected")).toHaveText("1 / 0");
+    await expect(page.locator("#capture-foreign")).toHaveText("1 / 0");
+    expect(await finished).toEqual({ code: 0, error: "" });
+    await expect(page.locator("#freshness-text")).toContainText(
+      "ATTITUDE périmée",
+    );
+    await expect(page.locator("#receiver-status")).toHaveText(
+      "Écoute ouverte · réception périmée",
+      { timeout: 5000 },
+    );
+    await expect(page.locator("#heartbeat-age")).toContainText("Périmé");
+    await expect(page.locator("#stop-button")).toBeVisible();
+    await page
+      .locator("#annotation-text")
+      .fill("Émetteur de test arrêté ; écoute encore ouverte");
+    await page.locator("#annotation-form button").click();
+    await expect(page.locator("#event-list")).toContainText(
+      "Émetteur de test arrêté ; écoute encore ouverte",
+    );
+    await page.locator("#stop-button").click();
+    await expect(page.locator("#receiver-status")).toHaveText(
+      "Écoute arrêtée · rejeu",
+    );
+    await expect(page.locator("#capture-button")).toBeEnabled();
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.locator("#capture-button").click(),
+    ]);
+    const capture = JSON.parse(await readFile(await download.path(), "utf8"));
+    expect(capture.session.source).toBe("mavlink-udp");
+    expect(capture.session.metadata.environment).toBe("simulation");
+    expect(capture.capture.datagram_count).toBe(capture.datagrams.length);
+    expect(capture.capture.dispositions.invalid).toBe(1);
+    expect(capture.capture.dispositions.foreign_source).toBe(1);
+    expect(
+      capture.datagrams.every(
+        (datagram) => Buffer.from(datagram.raw_base64, "base64").length > 0,
+      ),
+    ).toBe(true);
+    const count = await page.locator("#capture-count").textContent();
+    await page.reload();
+    await expect(page.locator("#capture-count")).toHaveText(count);
+    await expect(page.locator("#source-badge")).toHaveText("MAVLink UDP");
+    await expect(page.locator("#receiver-status")).toHaveText(
+      "Écoute arrêtée · rejeu",
+    );
+    await expect(page.locator("#experiment-panel")).toBeHidden();
+    await page.screenshot({
+      path: "test-results/mavlink-desktop.png",
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator("#source-kind").selectOption("mavlink-udp");
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(390);
+    await page.screenshot({
+      path: "test-results/mavlink-mobile.png",
+      fullPage: true,
+    });
+    expect(errors).toEqual([]);
+  } finally {
+    if (sender && sender.exitCode === null) sender.kill("SIGTERM");
+    if (finished) await finished;
+    if (sessionId) {
+      const detail = await (
+        await page.request.get(`/api/sessions/${sessionId}`)
+      ).json();
+      if (detail.session.status === "live")
+        await page.request.post(`/api/sessions/${sessionId}/stop`, {
+          data: {},
+        });
+    }
+  }
 });

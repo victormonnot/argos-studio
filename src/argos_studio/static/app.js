@@ -31,7 +31,9 @@ const sourceLabel = (session) =>
     ? "Simulation synthétique"
     : session.source === "argos-recording"
       ? "Enregistrement ARGOS"
-      : "Source inconnue";
+      : session.source === "mavlink-udp"
+        ? "MAVLink UDP"
+        : "Source inconnue";
 const statusLabel = (session) =>
   ({ live: "En direct", completed: "Terminée", interrupted: "Interrompue" })[
     session.status
@@ -105,16 +107,48 @@ function windowQuery() {
   if (state.end !== null) query.set("end_s", state.end);
   return query.size ? `?${query}` : "";
 }
+function renderSourceSettings() {
+  const mavlink = $("source-kind").value === "mavlink-udp";
+  $("mavlink-settings").hidden = !mavlink;
+  $("mavlink-settings").disabled = !mavlink || state.busy.has("start");
+  text(
+    "source-description",
+    mavlink
+      ? "MAVLink local · SITL déclaré · 3 min maximum"
+      : "Source synthétique · un véhicule · 3 min maximum",
+  );
+  text(
+    "source-help",
+    mavlink
+      ? "Un émetteur local, une identité attendue, aucune émission du Studio."
+      : "Signal synthétique de développement, sans physique d’autopilote.",
+  );
+}
 function renderControls() {
   const session = state.detail?.session;
   const live = session?.status === "live";
   const anyLive = state.sessions.some((item) => item.status === "live");
-  $("start-button").disabled = anyLive || state.busy.has("start");
+  const mavlinkSelected = $("source-kind").value === "mavlink-udp";
+  const mavlinkAvailable = state.health?.mavlink?.available === true;
+  $("source-kind").querySelector('option[value="mavlink-udp"]').disabled =
+    !mavlinkAvailable;
+  $("source-kind").disabled = state.busy.has("start");
+  $("start-button").disabled =
+    anyLive ||
+    state.busy.has("start") ||
+    (mavlinkSelected && !mavlinkAvailable);
+  renderSourceSettings();
   $("start-button").title = anyLive
     ? "Arrêtez la session active avant de démarrer un nouvel essai."
     : "";
   $("stop-button").hidden = !live;
   $("stop-button").disabled = !live || state.busy.has("stop");
+  $("experiment-panel").hidden = session?.source !== "simulation";
+  $("capture-button").hidden = session?.source !== "mavlink-udp";
+  $("capture-button").disabled = !session || live || state.busy.has("capture");
+  $("capture-button").title = live
+    ? "Arrêtez la réception pour exporter la capture brute complète."
+    : "Télécharger les datagrammes conservés et leurs métadonnées.";
   $("dropout-button").disabled =
     !live ||
     session?.source !== "simulation" ||
@@ -129,7 +163,7 @@ function renderControls() {
     anyLive ||
     state.busy.has("import");
   $("import-file").title = anyLive
-    ? "Arrêtez la session synthétique avant un import."
+    ? "Arrêtez la session active avant un import."
     : "";
   if (state.health?.argos_import?.available) {
     text(
@@ -241,6 +275,7 @@ async function refreshSelection() {
     state.connectionFailed = true;
     showError(error, "connection");
     renderFreshness();
+    renderReceiver();
   } finally {
     if (state.inFlight === generation) state.inFlight = null;
   }
@@ -248,6 +283,7 @@ async function refreshSelection() {
 function renderSession() {
   const { session, samples, events } = state.detail;
   const simulated = session.source === "simulation";
+  const mavlink = session.source === "mavlink-udp";
   text("active-session-title", session.name);
   text("active-objective", session.objective || "Aucun objectif renseigné.");
   text("source-badge", sourceLabel(session));
@@ -257,7 +293,9 @@ function renderSession() {
     "source-notice",
     simulated
       ? "Signal synthétique de développement ; aucune physique d’autopilote simulée. Aucun matériel connecté, aucun modèle de langage actif."
-      : `Rejeu d’un fichier ARGOS. Origine déclarée : ${session.metadata?.environment === "simulation" ? "simulation" : session.metadata?.environment === "real" ? "matériel (déclaré)" : "non établie"}. Aucun flux matériel actif ; les horloges originales restent distinctes.`,
+      : mavlink
+        ? "Réception MAVLink passive locale. Origine déclarée : simulation SITL, non authentifiée ; une adresse locale ne la prouve pas. Aucun ordre envoyé au véhicule. Les datagrammes bruts sont conservés."
+        : `Rejeu d’un fichier ARGOS. Origine déclarée : ${session.metadata?.environment === "simulation" ? "simulation" : session.metadata?.environment === "real" ? "matériel (déclaré)" : "non établie"}. Aucun flux matériel actif ; les horloges originales restent distinctes.`,
   );
   text("provenance-id", session.id);
   text("provenance-source", sourceLabel(session));
@@ -273,6 +311,7 @@ function renderSession() {
     `${statusLabel(session)} · ${seconds(state.detail.live?.elapsed_s ?? session.elapsed_s)}`,
   );
   renderFreshness();
+  renderReceiver();
   renderChart();
   renderCursor();
   renderEvents(events);
@@ -301,12 +340,89 @@ function renderFreshness() {
   const label = state.connectionFailed
     ? "Service injoignable"
     : {
-        fresh: `Flux reçu${age}`,
-        stale: `Mesure périmée${age}`,
+        fresh: `${state.detail?.session.source === "mavlink-udp" ? "ATTITUDE reçue" : "Flux reçu"}${age}`,
+        stale: `${state.detail?.session.source === "mavlink-udp" ? "ATTITUDE périmée" : "Mesure périmée"}${age}`,
         offline: "Rejeu · hors ligne",
         empty: "En attente de mesures",
       }[freshness];
   text("freshness-text", label);
+}
+function renderReceiver() {
+  const detail = state.detail;
+  const mavlink = detail?.session.source === "mavlink-udp";
+  $("receiver-panel").hidden = !mavlink;
+  if (!mavlink) return;
+  const metadata = detail.session.metadata ?? {};
+  const live = detail.live ?? {};
+  const replay = detail.session.status !== "live";
+  const status = state.connectionFailed
+    ? "unavailable"
+    : replay
+      ? "offline"
+      : (live.connection_status ?? "waiting");
+  const labels = {
+    waiting: "Écoute ouverte · en attente",
+    receiving: "Réception en cours",
+    stale: "Écoute ouverte · réception périmée",
+    offline: "Écoute arrêtée · rejeu",
+    unavailable: "État du service inconnu",
+  };
+  text("receiver-status", labels[status] ?? "État de réception inconnu");
+  $("receiver-status").className =
+    `receiver-status ${["waiting", "receiving", "stale", "offline", "unavailable"].includes(status) ? status : "unavailable"}`;
+  text(
+    "receiver-endpoint",
+    `${metadata.listen_host ?? "127.0.0.1"}:${metadata.listen_port ?? "—"}`,
+  );
+  text(
+    "receiver-identity",
+    `Système ${live.system_id ?? metadata.vehicle?.system_id ?? "—"} · composant ${live.component_id ?? metadata.vehicle?.component_id ?? "—"}`,
+  );
+  text(
+    "receiver-peer",
+    live.peer
+      ? `${live.peer.host}:${live.peer.port}`
+      : replay
+        ? "Non disponible en rejeu · voir capture"
+        : "Non identifié",
+  );
+  text(
+    "heartbeat-age",
+    state.connectionFailed
+      ? "État inconnu"
+      : replay
+        ? live.heartbeat
+          ? "Conservé à l’arrêt · voir champs"
+          : "Non disponible en rejeu · voir capture"
+        : Number.isFinite(live.heartbeat_age_s)
+          ? live.heartbeat_freshness === "stale"
+            ? `Périmé · reçu il y a ${seconds(live.heartbeat_age_s)}`
+            : `Reçu il y a ${seconds(live.heartbeat_age_s)}`
+          : "Jamais observé",
+  );
+  $("heartbeat-details").hidden = !live.heartbeat;
+  text(
+    "heartbeat-fields",
+    live.heartbeat ? JSON.stringify(live.heartbeat, null, 2) : "",
+  );
+  const capture = detail.capture;
+  const dispositions = capture?.dispositions ?? {};
+  text("capture-count", number(capture?.datagram_count ?? 0, 0));
+  text("capture-accepted", number(dispositions.accepted ?? 0, 0));
+  text(
+    "capture-rejected",
+    `${number(dispositions.invalid ?? 0, 0)} / ${number(dispositions.signed ?? 0, 0)}`,
+  );
+  text(
+    "capture-foreign",
+    `${number(dispositions.foreign_source ?? 0, 0)} / ${number(dispositions.foreign_peer ?? 0, 0)}`,
+  );
+  text(
+    "capture-size",
+    capture
+      ? `${number(capture.raw_bytes ?? 0, 0)} octets bruts conservés · comptages sur la session entière, hors filtre temporel.`
+      : "Qualité de capture non disponible.",
+  );
 }
 function renderChart() {
   const chart = $("signal-chart");
@@ -474,6 +590,10 @@ function renderEvents(events) {
       source_error: "Erreur de la source",
       imported: "Import d’un enregistrement",
       recovered: "Session récupérée après arrêt du service",
+      peer_identified: "Émetteur identifié",
+      reception_stale: "Réception périmée",
+      reception_resumed: "Réception rétablie",
+      capture_limit: "Limite de capture atteinte",
     };
     label.append(element("small", "", kindLabels[event.kind] ?? "Événement"));
     button.append(element("time", "", seconds(event.at_s)), label);
@@ -622,17 +742,29 @@ async function action(name, callback) {
     renderControls();
   }
 }
+$("source-kind").addEventListener("change", renderControls);
 $("start-form").addEventListener("submit", (event) => {
   event.preventDefault();
   action("start", async () => {
-    const session = await post("/api/sessions", {
+    const mavlink = $("source-kind").value === "mavlink-udp";
+    const payload = {
       name: $("session-name").value.trim(),
       objective: $("session-objective").value.trim(),
-    });
+    };
+    if (mavlink)
+      Object.assign(payload, {
+        source: "mavlink-udp",
+        listen_port: Number($("listen-port").value),
+        system_id: Number($("system-id").value),
+        component_id: Number($("component-id").value),
+      });
+    const session = await post("/api/sessions", payload);
     await loadSessions();
     await selectSession(session.id);
     notify(
-      "Acquisition synthétique démarrée. Les mesures sont enregistrées localement.",
+      mavlink
+        ? "Écoute UDP locale ouverte. En attente des messages de la source déclarée."
+        : "Acquisition synthétique démarrée. Les mesures sont enregistrées localement.",
     );
   });
 });
@@ -722,21 +854,25 @@ $("signal-chart").addEventListener("click", (event) => {
   state.cursor = index;
   renderCursor();
 });
+async function downloadSessionJson(suffix, filename) {
+  const id = state.id;
+  const data = await api(sessionPath(suffix, id));
+  const url = URL.createObjectURL(
+    new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
+  );
+  const link = element("a");
+  link.href = url;
+  link.download = `argos-studio-${id}${filename}.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 $("export-button").addEventListener("click", () =>
-  action("export", async () => {
-    const id = state.id;
-    const data = await api(sessionPath("/export", id));
-    const url = URL.createObjectURL(
-      new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
-    );
-    const link = element("a");
-    link.href = url;
-    link.download = `argos-studio-${id}.json`;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }),
+  action("export", () => downloadSessionJson("/export", "")),
+);
+$("capture-button").addEventListener("click", () =>
+  action("capture", () => downloadSessionJson("/capture", "-capture")),
 );
 $("import-file").addEventListener("change", () =>
   action("import", async () => {
@@ -770,6 +906,10 @@ async function initialize() {
     state.health = health;
     state.sessions = sessions;
     text("version", health.version);
+    if (health.mavlink?.available) {
+      $("listen-host").value = health.mavlink.listen_host ?? "127.0.0.1";
+      $("listen-port").value = health.mavlink.default_port ?? 14580;
+    }
     if (!health.argos_import?.available)
       text(
         "import-status",

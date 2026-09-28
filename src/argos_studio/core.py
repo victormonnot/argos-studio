@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import sqlite3
@@ -9,13 +10,15 @@ import statistics
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from ipaddress import AddressValueError, IPv4Address
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-SOURCES = {"simulation", "argos-recording"}
+SOURCES = {"simulation", "argos-recording", "mavlink-udp"}
 STATUSES = {"live", "completed", "interrupted"}
+DATAGRAM_DISPOSITIONS = {"accepted", "invalid", "signed", "foreign_source", "foreign_peer"}
 SAMPLE_FIELDS = (
     "source_time_s",
     "elapsed_s",
@@ -47,6 +50,18 @@ def _text(value: Any, name: str, limit: int, *, empty: bool = False) -> str:
     return value
 
 
+def _json_object(value: dict[str, Any] | None, name: str) -> str:
+    if value is not None and not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object")
+    try:
+        encoded = json.dumps(value or {}, allow_nan=False, ensure_ascii=False)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(f"{name} must contain finite JSON data") from exc
+    if len(encoded.encode("utf-8")) > 65536:
+        raise ValueError(f"{name} exceeds 64 KiB")
+    return encoded
+
+
 class Store:
     """A local SQLite store with one connection per operation.
 
@@ -62,21 +77,54 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.executescript(
+            self._initialize_schema(connection)
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version > 1:
+            raise ValueError(f"Database schema version {version} requires a newer ARGOS Studio")
+        if version == 1:
+            return
+        # Build the replacement before dropping the old table. Renaming the old
+        # table first would rewrite the foreign keys in samples and events.
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sessions'"
+            ).fetchone()
+            connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS sessions (
+                CREATE TABLE sessions_v1 (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     objective TEXT NOT NULL,
-                    source TEXT NOT NULL CHECK(source IN ('simulation','argos-recording')),
+                    source TEXT NOT NULL
+                        CHECK(source IN ('simulation','argos-recording','mavlink-udp')),
                     status TEXT NOT NULL CHECK(status IN ('live','completed','interrupted')),
                     metadata TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     ended_at REAL,
                     elapsed_s REAL NOT NULL DEFAULT 0 CHECK(elapsed_s >= 0)
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS one_live_simulation
-                    ON sessions(source) WHERE source='simulation' AND status='live';
+                )
+                """
+            )
+            if existing:
+                connection.execute(
+                    "INSERT INTO sessions_v1 "
+                    "(id,name,objective,source,status,metadata,created_at,ended_at,elapsed_s) "
+                    "SELECT id,name,objective,source,status,metadata,created_at,ended_at,elapsed_s "
+                    "FROM sessions"
+                )
+                connection.execute("DROP TABLE sessions")
+            connection.execute("ALTER TABLE sessions_v1 RENAME TO sessions")
+            connection.execute(
+                "CREATE UNIQUE INDEX one_live_acquisition ON sessions((1)) "
+                "WHERE status='live' AND source IN ('simulation','mavlink-udp')"
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS samples (
                     id INTEGER PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -88,8 +136,14 @@ class Store:
                     pitch_deg REAL,
                     gyro_x_deg_s REAL,
                     UNIQUE(session_id, seq)
-                );
-                CREATE INDEX IF NOT EXISTS sample_window ON samples(session_id, elapsed_s);
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS sample_window ON samples(session_id, elapsed_s)"
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -97,9 +151,38 @@ class Store:
                     at_s REAL NOT NULL,
                     text TEXT NOT NULL,
                     created_at REAL NOT NULL
-                );
+                )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE datagrams (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    seq INTEGER NOT NULL,
+                    elapsed_s REAL NOT NULL,
+                    received_at REAL NOT NULL,
+                    peer_host TEXT NOT NULL,
+                    peer_port INTEGER NOT NULL,
+                    payload BLOB NOT NULL,
+                    disposition TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    sample_start_seq INTEGER,
+                    sample_count INTEGER NOT NULL,
+                    UNIQUE(session_id, seq),
+                    FOREIGN KEY (session_id,sample_start_seq) REFERENCES samples(session_id,seq)
+                )
+                """
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ValueError("Database migration found inconsistent foreign keys")
+            connection.execute("PRAGMA user_version=1")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys=ON")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -133,14 +216,7 @@ class Store:
         objective = _text(objective, "objective", 4000, empty=True)
         if source not in SOURCES or status not in STATUSES:
             raise ValueError("Unsupported session source or status")
-        if metadata is not None and not isinstance(metadata, dict):
-            raise ValueError("metadata must be an object")
-        try:
-            encoded = json.dumps(metadata or {}, allow_nan=False, ensure_ascii=False)
-        except (ValueError, TypeError, OverflowError) as exc:
-            raise ValueError("metadata must contain finite JSON data") from exc
-        if len(encoded.encode("utf-8")) > 65536:
-            raise ValueError("metadata exceeds 64 KiB")
+        encoded = _json_object(metadata, "metadata")
         now = time.time()
         return (
             str(uuid4()),
@@ -163,7 +239,7 @@ class Store:
                 values,
             )
         except sqlite3.IntegrityError as exc:
-            raise ValueError("A simulation session is already live") from exc
+            raise ValueError("An acquisition session is already live") from exc
 
     def create_session(
         self,
@@ -221,13 +297,139 @@ class Store:
                     "SELECT * FROM events WHERE session_id=? ORDER BY at_s,id", (session_id,)
                 )
             ]
+            capture = (
+                self._capture_summary(connection, session_id)
+                if session["source"] == "mavlink-udp"
+                else None
+            )
         session["sample_count"] = len(rows)
         analysis = self._analyze_rows(session, rows, start, end, threshold=0.25)
         window = analysis["window_s"]
         selected = [
             dict(row) for row in rows if window["start_s"] <= row["elapsed_s"] <= window["end_s"]
         ]
-        return {"session": session, "samples": selected, "events": events, "analysis": analysis}
+        return {
+            "session": session,
+            "samples": selected,
+            "events": events,
+            "analysis": analysis,
+            "capture": capture,
+        }
+
+    def append_datagram(
+        self,
+        session_id: str,
+        *,
+        elapsed_s: float,
+        received_at: float,
+        peer_host: str,
+        peer_port: int,
+        payload: bytes,
+        disposition: str,
+        details: dict[str, Any] | None = None,
+        samples: Iterable[dict[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Atomically persist a UDP receipt and the measurements derived from it."""
+        elapsed = _number(elapsed_s, "elapsed_s", minimum=0)
+        received = _number(received_at, "received_at", minimum=0)
+        if not isinstance(peer_host, str):
+            raise ValueError("Datagram evidence requires an IPv4 loopback peer")
+        try:
+            address = IPv4Address(peer_host)
+        except AddressValueError as exc:
+            raise ValueError("Datagram evidence requires an IPv4 loopback peer") from exc
+        if not address.is_loopback or str(address) != peer_host:
+            raise ValueError("Datagram evidence requires a canonical IPv4 loopback peer")
+        if (
+            isinstance(peer_port, bool)
+            or not isinstance(peer_port, int)
+            or not 1 <= peer_port <= 65535
+        ):
+            raise ValueError("peer_port must be an integer between 1 and 65535")
+        if not isinstance(payload, bytes) or len(payload) > 65535:
+            raise ValueError("payload must contain at most 65535 bytes")
+        if not isinstance(disposition, str) or disposition not in DATAGRAM_DISPOSITIONS:
+            raise ValueError("Unsupported datagram disposition")
+        encoded = _json_object(details, "details")
+        values = [self._sample_values(sample) for sample in samples]
+        if any(value[1] != elapsed or value[2] != received for value in values):
+            raise ValueError("Derived samples must retain the datagram receipt timestamps")
+        if values and disposition != "accepted":
+            raise ValueError("Only accepted datagrams may produce samples")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = self._require_session(connection, session_id)
+            if session["source"] != "mavlink-udp" or session["status"] != "live":
+                raise ValueError("Datagrams require a live MAVLink UDP session")
+            previous = connection.execute(
+                "SELECT seq,elapsed_s FROM datagrams WHERE session_id=? ORDER BY seq DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            seq = previous["seq"] + 1 if previous else 0
+            if previous is not None and elapsed < previous["elapsed_s"]:
+                raise ValueError("Datagrams must be in nondecreasing receipt order")
+            self._insert_samples(connection, session_id, values)
+            start_seq = None
+            if values:
+                last_seq = connection.execute(
+                    "SELECT MAX(seq) FROM samples WHERE session_id=?", (session_id,)
+                ).fetchone()[0]
+                start_seq = last_seq - len(values) + 1
+            connection.execute(
+                "INSERT INTO datagrams (session_id,seq,elapsed_s,received_at,peer_host,peer_port,"
+                "payload,disposition,details,sample_start_seq,sample_count) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    session_id,
+                    seq,
+                    elapsed,
+                    received,
+                    peer_host,
+                    peer_port,
+                    payload,
+                    disposition,
+                    encoded,
+                    start_seq,
+                    len(values),
+                ),
+            )
+            connection.execute(
+                "UPDATE sessions SET elapsed_s=MAX(elapsed_s,?) WHERE id=?", (elapsed, session_id)
+            )
+        return {"seq": seq, "sample_start_seq": start_seq, "sample_count": len(values)}
+
+    def datagrams(self, session_id: str) -> list[dict[str, Any]]:
+        """Return raw evidence as JSON-safe base64 without truncating the capture."""
+        with self._connection() as connection:
+            self._require_session(connection, session_id)
+            rows = connection.execute(
+                "SELECT * FROM datagrams WHERE session_id=? ORDER BY seq", (session_id,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["raw_base64"] = base64.b64encode(item.pop("payload")).decode("ascii")
+            item["details"] = json.loads(item["details"])
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _capture_summary(connection: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+        rows = connection.execute(
+            "SELECT disposition,COUNT(*) AS count,SUM(LENGTH(payload)) AS raw_bytes "
+            "FROM datagrams WHERE session_id=? GROUP BY disposition",
+            (session_id,),
+        ).fetchall()
+        return {
+            "datagram_count": sum(row["count"] for row in rows),
+            "raw_bytes": sum(row["raw_bytes"] for row in rows),
+            "dispositions": {row["disposition"]: row["count"] for row in rows},
+        }
+
+    def capture_summary(self, session_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            self._require_session(connection, session_id)
+            return self._capture_summary(connection, session_id)
 
     @staticmethod
     def _sample_values(sample: dict[str, Any]) -> tuple[float | None, ...]:

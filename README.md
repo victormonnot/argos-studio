@@ -3,10 +3,11 @@
 A local UAV engineering workspace for recording an experiment, inspecting its
 measurements and retaining the evidence behind an observation.
 
-The first workflow combines a synthetic attitude source, persistent sessions,
-time-linked annotations, reception-gap analysis and replay. An optional adapter
-imports existing ARGOS recordings through their native validator. The interface
-is currently in French; source code and technical documentation are in English.
+Record a local MAVLink/SITL stream or a synthetic attitude source, attach
+observations, inspect reception gaps and replay the retained evidence. An
+optional adapter imports existing ARGOS recordings through their native
+validator. The interface is currently in French; source code and technical
+documentation are in English.
 
 ## Run locally
 
@@ -32,8 +33,9 @@ on your own computer.
 
 ## Inspect a first experiment
 
-1. Enter a session name and an objective, then select **Démarrer**. Roll, pitch
-   and gyro X are generated at a nominal 20 Hz and saved as they arrive.
+1. Select **Simulation synthétique**, enter a session name and an objective,
+   then select **Démarrer**. Roll, pitch and gyro X are generated at a nominal
+   20 Hz and saved as they arrive.
 2. Add an observation with **Marquer**. Each annotation retains its position in
    the session timeline.
 3. Select **Provoquer une interruption de 2 s**. The source suspends sample
@@ -52,7 +54,57 @@ scheduling and sample cadence also contribute to that interval.
 
 Gap analysis describes received data. It does not identify a network fault,
 count lost packets or establish sensor-to-display latency. The same analysis
-functions serve synthetic sessions and imported recordings.
+functions serve synthetic sessions, live MAVLink reception and imported recordings.
+
+## Receive a local MAVLink/SITL stream
+
+Select **MAVLink local · SITL déclaré**, enter a name and objective, and confirm
+the local UDP port and expected MAVLink system/component identifiers. Defaults
+are `127.0.0.1:14580` and source `1 / 1`. Select **Démarrer** to begin listening,
+then start your separately configured simulator or telemetry forwarder.
+
+For ArduPilot SITL, the following simulator startup option directs a configured
+MAVLink serial channel to Studio:
+
+```text
+--serial0=udpclient:127.0.0.1:14580
+```
+
+When using `sim_vehicle.py`, pass the option through `-A`, as described in the
+[ArduPilot UDP setup guide](https://ardupilot.org/dev/docs/using-sitl-for-ardupilot-testing.html#using-a-different-gcs-instead-of-mavproxy-via-udp).
+Configure the sender to stream ATTITUDE measurements before the test. Studio
+sends no heartbeat, stream-rate request, parameter update or vehicle command,
+and the application does not launch a simulator automatically. The isolated
+check below provides a separate, reproducible simulator setup.
+
+The interface distinguishes a listening socket with no matching source from
+received telemetry. ATTITUDE measurements become stale after 0.3 seconds without
+a valid reception; heartbeat age is shown separately with a 2.5-second threshold.
+These are local reception-age thresholds, not vehicle readiness checks. Stopping
+the sender leaves the last measurements visible with their increasing age.
+**Arrêter la session** closes Studio's listener and preserves the session; it
+does not stop the external source. The interruption button is available only for
+the synthetic source.
+
+The first validated datagram containing the selected system/component pins its
+UDP peer for the session. Traffic from another peer or source is retained as
+excluded evidence when it comes from an IPv4 loopback address; other sender
+addresses are ignored. If a simulator restart changes its UDP source port, start a
+new Studio session. The source is declared as simulation by selecting this
+profile; neither the declaration nor the peer address authenticates its origin.
+
+The receiver accepts complete unsigned MAVLink 1/2 datagrams in the
+`ardupilotmega` dialect. Malformed, partial, unknown-message and bad-CRC
+datagrams cannot update measurements. Signed traffic is unsupported, and a
+configured `MAV_IGNORE_CRC` bypass prevents acquisition. Within the capture
+limits, original datagrams, including rejected ones, remain available. This decoder uses
+Pymavlink's [direct dialect interface](https://mavlink.io/en/mavgen_python/).
+
+ATTITUDE angles are converted from radians to degrees and angular rates from
+radians/second to degrees/second. Its `time_boot_ms` remains vehicle boot time.
+Studio records host receipt time separately and uses a monotonic host clock for
+session-relative intervals; no clock offset or end-to-end latency is inferred.
+See the [MAVLink ATTITUDE definition](https://mavlink.io/en/messages/common.html#ATTITUDE).
 
 ## Import an ARGOS recording
 
@@ -66,7 +118,7 @@ ARGOS_STUDIO_ARGOS_PYTHON=/absolute/path/to/argos/.venv/bin/python \
 .venv/bin/argos-studio
 ```
 
-Stop any active synthetic session, expand **Importer un enregistrement**, and
+Stop any active acquisition, expand **Importer un enregistrement**, and
 select a native ARGOS `.jsonl` recording. For example, ARGOS's provided
 `examples/demo-flight/05aa147d371144c793c8f88ec3ef0509.jsonl` contains a recorded
 Gazebo/ArduPilot simulation; it is suitable for telemetry inspection without
@@ -93,14 +145,24 @@ capture date is retained as metadata without assuming clock synchronization.
 ## Data and limits
 
 Data is stored in the ignored `.data/` directory by default: a SQLite database
-for sessions, samples and events, and `recordings/` for imported originals.
+for sessions, samples, events and raw UDP datagrams, and `recordings/` for
+imported originals.
 `ARGOS_STUDIO_DATA_DIR` also selects the directory. An interrupted acquisition is
-retained and marked as interrupted when the application restarts.
+retained and marked as interrupted when the application restarts. Earlier Studio
+databases are migrated transactionally at startup, preserving existing sessions.
+
+UDP payloads are stored as binary data with receipt timestamps, peer, disposition
+and references to the derived sample sequence range. After stopping acquisition,
+`GET /api/sessions/{id}/capture` exports this evidence as JSON with base64 payloads.
+The normal session export includes measurements, analysis and capture counts;
+the separate capture export includes every retained datagram's bytes.
 
 | Boundary | Limit |
 | --- | --- |
-| Concurrent acquisition | One synthetic source |
-| Synthetic session | Three minutes |
+| Concurrent acquisition | One synthetic or MAVLink UDP source |
+| Acquisition session | Three minutes |
+| MAVLink capture | 10 MiB, 20,000 datagrams and 100,000 derived samples |
+| MAVLink datagram | 128 complete frames |
 | Sessions per data directory | 100 |
 | Imported recording | 10 MiB and 100,000 native events |
 | Native import validation | 20 seconds |
@@ -110,10 +172,9 @@ reached, retain the existing directory and start with another data directory.
 For a backup, stop the server and copy the **whole** data directory, including
 any SQLite auxiliary files and original recordings.
 
-This version has no physical vehicle connection, flight or bench commands,
-language-model integration, or integrated UAV Debugger/Meridian module. It
-provides the acquisition, persistence and analysis workflow on which those
-separate capabilities can build.
+The implemented live profile is local UDP reception for declared simulation.
+TCP, serial/USB acquisition, hardware commands, language-model integration and
+integrated UAV Debugger/Meridian modules are outside this version.
 
 ## Implementation and API
 
@@ -121,6 +182,8 @@ separate capabilities can build.
 | --- | --- |
 | [`core.py`](src/argos_studio/core.py) | SQLite persistence, validation and deterministic window analysis |
 | [`simulator.py`](src/argos_studio/simulator.py) | Synthetic acquisition, bounded interruptions and lifecycle |
+| [`mavlink.py`](src/argos_studio/mavlink.py) | Receive-only UDP, decoding, source selection and freshness |
+| [`acquisition.py`](src/argos_studio/acquisition.py) | Route session operations to the active source |
 | [`app.py`](src/argos_studio/app.py) | Local FastAPI endpoints, process ownership and HTTP boundaries |
 | [`argos_import.py`](src/argos_studio/argos_import.py) | Optional subprocess adapter to ARGOS's native recording reader |
 | [`static/`](src/argos_studio/static/) | Browser interface, charts, timeline and replay without a build step |
@@ -132,12 +195,13 @@ and response routes. Key endpoints are:
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Runtime limits and optional import configuration |
-| `GET /api/sessions` / `POST /api/sessions` | List sessions or start synthetic acquisition |
+| `GET /api/sessions` / `POST /api/sessions` | List sessions or start synthetic/MAVLink UDP acquisition |
 | `GET /api/sessions/{id}` | Measurements, events and source status; optional `start_s` / `end_s` |
 | `POST /api/sessions/{id}/annotations` | Attach an observation to a session time |
-| `POST /api/sessions/{id}/dropout` / `stop` | Interrupt or finish the active synthetic source |
+| `POST /api/sessions/{id}/dropout` / `stop` | Interrupt synthetic reception or stop the active acquisition |
 | `GET /api/sessions/{id}/analysis` | Evidence for a selected reception-time window |
 | `GET /api/sessions/{id}/export` / `raw` | Export session JSON or retrieve an imported original |
+| `GET /api/sessions/{id}/capture` | Export a stopped MAVLink session's raw UDP evidence |
 | `POST /api/import/argos` | Validate and import a native recording |
 
 Writes use JSON, except the import endpoint, which accepts
@@ -167,3 +231,53 @@ npm run test:e2e
 The browser suite starts its own server on port 8766 with a temporary data
 directory. It exercises capture, annotation, interruption evidence, export,
 replay, mobile layout and connection errors without touching saved sessions.
+
+## Optional isolated SITL check
+
+The native check requires **Linux x86_64**, `unshare`, `iproute2` and permission
+to create user, network and PID namespaces. It uses an already installed
+[ArduCopter 4.6.3 executable](https://firmware.ardupilot.org/Copter/stable-4.6.3/SITL_x86_64_linux_gnu/arducopter)
+with SHA-256:
+
+```text
+7862662092edc2861fc03da3d6fb2f0136d1670e563ca324eb52c1a324d1e14b
+```
+
+No binary is downloaded or rebuilt by Studio. The check creates fresh simulator
+state and a passive receiver in one loopback-only namespace. This isolates the
+simulator's auxiliary RC socket, which the pinned
+[ArduPilot RC backend](https://github.com/ArduPilot/ardupilot/blob/3fc7011a7d3dc047cbb17d8bd98ee94577d144c6/libraries/AP_RCProtocol/AP_RCProtocol_UDP.cpp)
+binds on all interfaces. If namespace setup fails, the test skips without
+launching SITL.
+
+```sh
+ARGOS_STUDIO_SITL_BINARY=/absolute/path/to/arducopter \
+.venv/bin/python -m pytest tests/test_sitl.py -q
+```
+
+To retain an inspectable run, invoke the same helper from the checkout using a
+**new** output directory:
+
+```sh
+unshare --user --map-root-user --net --pid --fork --kill-child=SIGKILL \
+  /bin/sh -c 'ip link set dev lo up && exec "$@"' sh \
+  "$PWD/.venv/bin/python" -B "$PWD/tools/run_sitl.py" \
+  --binary /absolute/path/to/arducopter \
+  --output "$PWD/.data/sitl-proof"
+```
+
+The helper verifies the binary hash, starts only its own disarmed simulator,
+observes HEARTBEAT and ATTITUDE, stops that process, verifies stale reception,
+and reopens the persisted session to check its measurements and raw references.
+It retains `result.json`, `session.json`, `capture.json`, the SQLite database,
+simulator parameters and output. This validates ground telemetry reception and
+persistence, not flight behavior.
+
+After the helper exits, inspect that session with a separate Studio instance:
+
+```sh
+.venv/bin/argos-studio --data-dir .data/sitl-proof --port 8767
+```
+
+Open [http://127.0.0.1:8767](http://127.0.0.1:8767). Viewing the saved evidence
+does not restart the simulator.
