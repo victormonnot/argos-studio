@@ -370,7 +370,7 @@
                         id="window-start"
                         type="number"
                         min="0"
-                        step="0.1"
+                        step="any"
                         placeholder="0"
                       /><span>s</span></label
                     ><label
@@ -378,7 +378,7 @@
                         id="window-end"
                         type="number"
                         min="0"
-                        step="0.1"
+                        step="any"
                         placeholder="fin"
                       /><span>s</span></label
                     ><button class="button compact subtle" type="submit">
@@ -492,6 +492,121 @@
               </details>
             </aside>
           </div>
+          <section
+            class="panel investigation-panel"
+            aria-labelledby="investigation-title"
+          >
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">OBSERVATION · PREUVES · VÉRIFICATION</p>
+                <h3 id="investigation-title">Investigation de réception</h3>
+              </div>
+              <span class="investigation-method"
+                >Analyse déterministe versionnée · sans LLM</span
+              >
+            </div>
+            <form id="investigation-form" class="investigation-form">
+              <label for="investigation-context"
+                >Contexte ou hypothèse à conserver
+                <span>facultatif</span></label
+              >
+              <textarea
+                id="investigation-context"
+                maxlength="2000"
+                rows="2"
+                placeholder="Ce que vous cherchez à vérifier sur la réception…"
+                aria-describedby="investigation-context-help"
+              ></textarea>
+              <p id="investigation-context-help" class="small muted">
+                Ce texte est conservé dans le rapport ; il n’est pas interprété
+                automatiquement.
+              </p>
+              <div class="investigation-actions">
+                <p id="investigation-window-label" class="small muted">
+                  La fenêtre courante sera analysée.
+                </p>
+                <button
+                  id="investigate-button"
+                  type="submit"
+                  class="button primary"
+                >
+                  Investiguer cette fenêtre
+                </button>
+              </div>
+            </form>
+            <div class="investigation-history-row">
+              <label for="investigation-history"
+                >Rapports enregistrés<select
+                  id="investigation-history"
+                  disabled
+                >
+                  <option value="">Aucun rapport</option>
+                </select></label
+              >
+              <button
+                id="investigation-export"
+                type="button"
+                class="button subtle"
+                disabled
+              >
+                Exporter le rapport
+              </button>
+            </div>
+            <p
+              id="investigation-status"
+              class="investigation-status"
+              role="status"
+            >
+              Aucune investigation lancée pour cette session.
+            </p>
+            <article
+              id="investigation-report"
+              class="investigation-report"
+              hidden
+            >
+              <div class="report-heading">
+                <div>
+                  <p id="report-outcome" class="eyebrow"></p>
+                  <h4 id="report-summary"></h4>
+                </div>
+                <span id="report-version" class="count"></span>
+              </div>
+              <p id="report-snapshot" class="report-snapshot"></p>
+              <details class="report-context">
+                <summary>Contexte conservé avec ce rapport</summary>
+                <p id="report-context-text"></p>
+                <button
+                  id="reuse-report-context"
+                  class="text-button"
+                  type="button"
+                >
+                  Reprendre ce contexte pour la prochaine investigation
+                </button>
+              </details>
+              <div id="report-findings" class="report-findings"></div>
+              <section
+                class="report-evidence-section"
+                aria-labelledby="report-evidence-title"
+              >
+                <h4 id="report-evidence-title">Pièces de preuve</h4>
+                <p class="small muted">
+                  Les bornes et données ci-dessous appartiennent au rapport
+                  figé. Ouvrez une preuve pour inspecter les observations
+                  d’origine.
+                </p>
+                <div id="report-evidence"></div>
+              </section>
+              <details class="report-limits">
+                <summary>Limites de cette investigation</summary>
+                <ul id="report-limitations"></ul>
+              </details>
+              <details class="report-tools">
+                <summary>Calculs exécutés et empreinte des données</summary>
+                <p id="report-fingerprint"></p>
+                <div id="report-tools"></div>
+              </details>
+            </article>
+          </section>
           <footer class="workspace-footer">
             <span
               >Données persistées localement · horloges de source et de

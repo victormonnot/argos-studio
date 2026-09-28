@@ -6,7 +6,8 @@ measurements and retaining the evidence behind an observation.
 Record a local MAVLink/SITL stream or a synthetic attitude source, attach
 observations, inspect reception gaps and replay the retained evidence. An
 optional adapter imports existing ARGOS recordings through their native
-validator. The interface is currently in French; source code and technical
+validator. Versioned reception investigations retain findings, evidence and
+proposed checks across sessions. The interface is currently in French; source code and technical
 documentation are in English.
 
 ## Run locally
@@ -46,6 +47,10 @@ on your own computer.
 5. Select a time window. **Continuité du flux** reports reception intervals and
    links detected gaps to the samples that bound them. Export the session as JSON
    with its metadata, samples, events and analysis.
+6. In **Investigation de réception**, optionally record a working hypothesis,
+   then select **Investiguer cette fenêtre**. Open a finding's evidence to
+   inspect its exact measurement pair and return to that window in the chart.
+   Reopen saved reports from the history or export a report as JSON.
 
 The generated angles follow deterministic mathematical signals. They do not model
 flight dynamics or sensor performance. A requested two-second interruption and
@@ -55,6 +60,43 @@ scheduling and sample cadence also contribute to that interval.
 Gap analysis describes received data. It does not identify a network fault,
 count lost packets or establish sensor-to-display latency. The same analysis
 functions serve synthetic sessions, live MAVLink reception and imported recordings.
+
+## Investigate reception
+
+An investigation operates on one consistent database snapshot, during acquisition
+or replay. It combines the same receipt-interval analysis used by the chart with
+source-clock regressions, capture dispositions and recorded experiment events.
+For MAVLink captures, it examines datagrams strictly between the measurements
+bounding each gap. A retained HEARTBEAT or other accepted frame from the selected
+source contradicts total reception silence over that interval; it does not prove
+continuous connectivity or explain the missing ATTITUDE measurements. Excluded
+traffic cannot establish the presence of the selected source.
+
+Each finding separates the observation, references, hypotheses, uncertainty and
+a proposed verification. Boundary silence and incomplete acquisitions are shown
+separately from intervals bounded by two samples. The 0.25-second threshold is
+an inspection threshold, not a declared vehicle stream-rate requirement. At most
+the 12 largest gaps receive individual findings; all gaps are counted and any
+omissions are stated. Imported ARGOS sessions expose ATTITUDE samples to these
+tools; other message types remain in their original recording and are not
+correlated by this version.
+
+Reports are **deterministic and do not use a language model**. The optional context
+is retained as user-supplied text, without automatic interpretation. Suggested
+checks are recorded, not executed. A changed hypothesis or new observations can
+be examined by creating another report; existing reports remain unchanged.
+
+The snapshot ends at the persisted session duration, which can lag current time
+during a live reception silence. Reports include the algorithm version, tool
+parameters/results, snapshot counts, evidence references and a SHA-256 digest.
+`investigation.fingerprint()` hashes canonical UTF-8 JSON (sorted keys, compact
+separators) from `Store.investigation_input()`: the session, all samples, events
+and datagram metadata, including each payload's SHA-256. Window and context are
+separate report parameters. The digest identifies recorded inputs, not their
+authenticity. The snapshot stores the original session fields and last sample,
+datagram and event identifiers, so its input can be reconstructed after later
+acquisition or annotations. Evidence excerpts are embedded in the report;
+complete UDP bytes remain in the separate raw capture export.
 
 ## Receive a local MAVLink/SITL stream
 
@@ -145,7 +187,7 @@ capture date is retained as metadata without assuming clock synchronization.
 ## Data and limits
 
 Data is stored in the ignored `.data/` directory by default: a SQLite database
-for sessions, samples, events and raw UDP datagrams, and `recordings/` for
+for sessions, samples, events, investigations and raw UDP datagrams, and `recordings/` for
 imported originals.
 `ARGOS_STUDIO_DATA_DIR` also selects the directory. An interrupted acquisition is
 retained and marked as interrupted when the application restarts. Earlier Studio
@@ -166,6 +208,7 @@ the separate capture export includes every retained datagram's bytes.
 | Sessions per data directory | 100 |
 | Imported recording | 10 MiB and 100,000 native events |
 | Native import validation | 20 seconds |
+| Investigations per session | 50 immutable reports, up to 4 MiB each |
 
 There is no automatic deletion or total disk quota. When the session limit is
 reached, retain the existing directory and start with another data directory.
@@ -184,6 +227,7 @@ integrated UAV Debugger/Meridian modules are outside this version.
 | [`simulator.py`](src/argos_studio/simulator.py) | Synthetic acquisition, bounded interruptions and lifecycle |
 | [`mavlink.py`](src/argos_studio/mavlink.py) | Receive-only UDP, decoding, source selection and freshness |
 | [`acquisition.py`](src/argos_studio/acquisition.py) | Route session operations to the active source |
+| [`investigation.py`](src/argos_studio/investigation.py) | Snapshot-based reception tools, evidence references and versioned reports |
 | [`app.py`](src/argos_studio/app.py) | Local FastAPI endpoints, process ownership and HTTP boundaries |
 | [`argos_import.py`](src/argos_studio/argos_import.py) | Optional subprocess adapter to ARGOS's native recording reader |
 | [`static/`](src/argos_studio/static/) | Browser interface, charts, timeline and replay without a build step |
@@ -200,12 +244,17 @@ and response routes. Key endpoints are:
 | `POST /api/sessions/{id}/annotations` | Attach an observation to a session time |
 | `POST /api/sessions/{id}/dropout` / `stop` | Interrupt synthetic reception or stop the active acquisition |
 | `GET /api/sessions/{id}/analysis` | Evidence for a selected reception-time window |
+| `GET` / `POST /api/sessions/{id}/investigations` | List reports or investigate a window with optional context |
+| `GET /api/sessions/{id}/investigations/{report_id}` | Read a saved report; append `/export` to download JSON |
 | `GET /api/sessions/{id}/export` / `raw` | Export session JSON or retrieve an imported original |
 | `GET /api/sessions/{id}/capture` | Export a stopped MAVLink session's raw UDP evidence |
 | `POST /api/import/argos` | Validate and import a native recording |
 
 Writes use JSON, except the import endpoint, which accepts
 `application/octet-stream`. Browser writes are restricted to the same origin.
+Investigation requests accept `start_s`, `end_s` and `context` (up to 2,000
+characters). Omitted bounds select the whole persisted session; explicit bounds
+must be finite, ordered and within its recorded duration. All tools run locally.
 
 ## Verify changes
 
@@ -230,7 +279,8 @@ npm run test:e2e
 
 The browser suite starts its own server on port 8766 with a temporary data
 directory. It exercises capture, annotation, interruption evidence, export,
-replay, mobile layout and connection errors without touching saved sessions.
+replay, investigations, report history/export, mobile layout and connection errors
+without touching saved sessions.
 
 ## Optional isolated SITL check
 

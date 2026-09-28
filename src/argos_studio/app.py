@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,7 +18,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .acquisition import Acquisition
 from .argos_import import read_argos_recording
-from .core import Store
+from .core import MAX_INVESTIGATIONS, Store
+from .investigation import ALGORITHM_VERSION, investigate
 from .mavlink import MAX_DATAGRAMS, MAX_RAW_BYTES, MAX_SAMPLES, dialect
 
 MAX_IMPORT_BYTES = 10 * 1024 * 1024
@@ -69,6 +71,13 @@ class Annotation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=2000)
     at_s: float = Field(ge=0, allow_inf_nan=False)
+
+
+class Investigation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    end_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    context: str = Field(default="", max_length=2000)
 
 
 Bound = Annotated[float | None, Query(ge=0, allow_inf_nan=False)]
@@ -150,6 +159,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def invalid_operation(request: Request, exc: ValueError):
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid_input(request: Request, exc: RequestValidationError):
+        # Do not echo NaN/Infinity (or arbitrary submitted data) into a JSON
+        # error response: those values cannot be serialized as standard JSON.
+        errors = [{key: error[key] for key in ("loc", "msg", "type")} for error in exc.errors()]
+        return JSONResponse({"detail": "Paramètres invalides.", "errors": errors}, status_code=422)
+
     def capacity() -> None:
         if len(app.state.store.list_sessions()) >= MAX_SESSIONS:
             raise HTTPException(
@@ -184,7 +200,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "max_duration_s": settings.max_duration_s,
                 "max_import_bytes": MAX_IMPORT_BYTES,
                 "max_sessions": MAX_SESSIONS,
+                "max_investigations_per_session": MAX_INVESTIGATIONS,
             },
+            "investigation": {"algorithm_version": ALGORITHM_VERSION, "uses_llm": False},
         }
 
     @app.get("/api/sessions")
@@ -224,6 +242,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/sessions/{session_id}/analysis")
     def analyze(session_id: str, start_s: Bound = None, end_s: Bound = None):
         return app.state.store.analyze(session_id, start_s=start_s, end_s=end_s)
+
+    @app.post("/api/sessions/{session_id}/investigations", status_code=201)
+    def run_investigation(session_id: str, body: Investigation):
+        return investigate(app.state.store, session_id, **body.model_dump())
+
+    @app.get("/api/sessions/{session_id}/investigations")
+    def list_investigations(session_id: str):
+        return app.state.store.list_investigations(session_id)
+
+    @app.get("/api/sessions/{session_id}/investigations/{investigation_id}")
+    def get_investigation(session_id: str, investigation_id: str):
+        return app.state.store.get_investigation(session_id, investigation_id)
+
+    @app.get("/api/sessions/{session_id}/investigations/{investigation_id}/export")
+    def export_investigation(session_id: str, investigation_id: str):
+        report = app.state.store.get_investigation(session_id, investigation_id)
+        filename = f"argos-investigation-{report['id']}.json"
+        return Response(
+            json.dumps(report, ensure_ascii=False, allow_nan=False),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
 
     @app.get("/api/sessions/{session_id}/export")
     def export_session(session_id: str):

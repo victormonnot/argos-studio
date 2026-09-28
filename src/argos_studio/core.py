@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import sqlite3
@@ -19,6 +20,8 @@ from uuid import uuid4
 SOURCES = {"simulation", "argos-recording", "mavlink-udp"}
 STATUSES = {"live", "completed", "interrupted"}
 DATAGRAM_DISPOSITIONS = {"accepted", "invalid", "signed", "foreign_source", "foreign_peer"}
+MAX_INVESTIGATIONS = 50
+MAX_INVESTIGATION_BYTES = 4 * 1024 * 1024
 SAMPLE_FIELDS = (
     "source_time_s",
     "elapsed_s",
@@ -50,15 +53,16 @@ def _text(value: Any, name: str, limit: int, *, empty: bool = False) -> str:
     return value
 
 
-def _json_object(value: dict[str, Any] | None, name: str) -> str:
+def _json_object(value: dict[str, Any] | None, name: str, *, max_bytes: int = 65536) -> str:
     if value is not None and not isinstance(value, dict):
         raise ValueError(f"{name} must be an object")
     try:
         encoded = json.dumps(value or {}, allow_nan=False, ensure_ascii=False)
-    except (ValueError, TypeError, OverflowError) as exc:
+        size = len(encoded.encode("utf-8"))
+    except (ValueError, TypeError, OverflowError, RecursionError) as exc:
         raise ValueError(f"{name} must contain finite JSON data") from exc
-    if len(encoded.encode("utf-8")) > 65536:
-        raise ValueError(f"{name} exceeds 64 KiB")
+    if size > max_bytes:
+        raise ValueError(f"{name} exceeds {max_bytes // 1024} KiB")
     return encoded
 
 
@@ -82,9 +86,12 @@ class Store:
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version > 1:
+        if version > 2:
             raise ValueError(f"Database schema version {version} requires a newer ARGOS Studio")
+        if version == 2:
+            return
         if version == 1:
+            Store._migrate_investigations(connection)
             return
         # Build the replacement before dropping the old table. Renaming the old
         # table first would rewrite the foreign keys in samples and events.
@@ -183,6 +190,27 @@ class Store:
             raise
         finally:
             connection.execute("PRAGMA foreign_keys=ON")
+        Store._migrate_investigations(connection)
+
+    @staticmethod
+    def _migrate_investigations(connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "CREATE TABLE investigations ("
+                "id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), "
+                "created_at REAL NOT NULL, report TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE INDEX investigation_session ON investigations(session_id,created_at DESC)"
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ValueError("Database migration found inconsistent foreign keys")
+            connection.execute("PRAGMA user_version=2")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -272,6 +300,121 @@ class Store:
                 "AS sample_count FROM sessions ORDER BY created_at DESC, id"
             )
             return [self._session(row) for row in rows]
+
+    def investigation_input(self, session_id: str) -> dict[str, Any]:
+        """Freeze complete evidence for an investigation without exposing raw bytes."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            session = self._session(self._require_session(connection, session_id))
+            samples = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM samples WHERE session_id=? ORDER BY seq", (session_id,)
+                )
+            ]
+            events = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM events WHERE session_id=? ORDER BY at_s,id", (session_id,)
+                )
+            ]
+            datagrams = []
+            for row in connection.execute(
+                "SELECT * FROM datagrams WHERE session_id=? ORDER BY seq", (session_id,)
+            ):
+                item = dict(row)
+                payload = item.pop("payload")
+                item["payload_sha256"] = hashlib.sha256(payload).hexdigest()
+                item["raw_bytes"] = len(payload)
+                item["details"] = json.loads(item["details"])
+                datagrams.append(item)
+        session["sample_count"] = len(samples)
+        return {"session": session, "samples": samples, "events": events, "datagrams": datagrams}
+
+    @staticmethod
+    def _investigation_report(report: dict[str, Any]) -> str:
+        if not isinstance(report, dict):
+            raise ValueError("report must be an object")
+        if {"id", "session_id", "created_at"}.intersection(report):
+            raise ValueError("report contains reserved investigation fields")
+        if type(report.get("schema_version")) is not int or report["schema_version"] != 1:
+            raise ValueError("Unsupported investigation report schema_version")
+        fields = {
+            "kind": str,
+            "algorithm_version": str,
+            "context": str,
+            "window_s": dict,
+            "outcome": str,
+            "summary": str,
+            "snapshot": dict,
+            "findings": list,
+            "evidence": list,
+            "tools": list,
+            "limitations": list,
+        }
+        for field, expected_type in fields.items():
+            if not isinstance(report.get(field), expected_type):
+                raise ValueError(f"report.{field} must be a {expected_type.__name__}")
+        return _json_object(report, "report", max_bytes=MAX_INVESTIGATION_BYTES)
+
+    def save_investigation(self, session_id: str, report: dict[str, Any]) -> dict[str, Any]:
+        """Append an immutable report; a changed context requires a new report."""
+        encoded = self._investigation_report(report)
+        investigation_id, created_at = str(uuid4()), time.time()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            count = connection.execute(
+                "SELECT COUNT(*) FROM investigations WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+            if count >= MAX_INVESTIGATIONS:
+                raise ValueError(
+                    f"A session may contain at most {MAX_INVESTIGATIONS} investigations"
+                )
+            connection.execute(
+                "INSERT INTO investigations (id,session_id,created_at,report) VALUES (?,?,?,?)",
+                (investigation_id, session_id, created_at, encoded),
+            )
+        return {
+            "id": investigation_id,
+            "session_id": session_id,
+            "created_at": created_at,
+            **json.loads(encoded),
+        }
+
+    def list_investigations(self, session_id: str) -> list[dict[str, Any]]:
+        summary_fields = (
+            "kind",
+            "algorithm_version",
+            "window_s",
+            "outcome",
+            "summary",
+            "context",
+        )
+        with self._connection() as connection:
+            self._require_session(connection, session_id)
+            result = []
+            for row in connection.execute(
+                "SELECT * FROM investigations WHERE session_id=? ORDER BY created_at DESC,id DESC",
+                (session_id,),
+            ):
+                item = dict(row)
+                report = json.loads(item.pop("report"))
+                result.append({**item, **{field: report[field] for field in summary_fields}})
+            return result
+
+    def get_investigation(self, session_id: str, investigation_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            self._require_session(connection, session_id)
+            row = connection.execute(
+                "SELECT * FROM investigations WHERE session_id=? AND id=?",
+                (session_id, investigation_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown investigation: {investigation_id}")
+            result = dict(row)
+            report = json.loads(result.pop("report"))
+            return {**result, **report}
 
     def snapshot(
         self,

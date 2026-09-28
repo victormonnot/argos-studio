@@ -290,3 +290,235 @@ test("passive MAVLink waits, receives, ages and preserves capture for replay", a
     }
   }
 });
+
+test("a reception investigation freezes live evidence, preserves context and reopens exact windows", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  let sessionId;
+  try {
+    await page.goto("/");
+    await page.locator("#source-kind").selectOption("simulation");
+    await page
+      .locator("#session-name")
+      .fill("Investigation de réception synthétique");
+    await page
+      .locator("#session-objective")
+      .fill(
+        "Relier une interruption aux observations et conserver le raisonnement",
+      );
+    await page.locator("#start-button").click();
+    await expect
+      .poll(async () =>
+        Number(await page.locator("#sample-value").textContent()),
+      )
+      .toBeGreaterThan(5);
+    const sessions = await (await page.request.get("/api/sessions")).json();
+    sessionId = sessions.find((session) => session.status === "live").id;
+    const context =
+      '<img src=x onerror="alert(1)"> Vérifier la coupure, sans conclure à une perte de paquets.';
+    await page.locator("#investigation-context").fill(context);
+    await page.locator("#dropout-button").click();
+    await expect(page.locator("#gap-list button")).toHaveCount(1, {
+      timeout: 8000,
+    });
+    const [response] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response
+            .url()
+            .endsWith(`/api/sessions/${sessionId}/investigations`) &&
+          response.request().method() === "POST",
+      ),
+      page.locator("#investigate-button").click(),
+    ]);
+    expect(response.status()).toBe(201);
+    const report = await response.json();
+    await expect(page.locator("#investigation-report")).toBeVisible();
+    await expect(page.locator("#report-summary")).toHaveText(report.summary);
+    await expect(page.locator("#report-version")).toHaveText(
+      "reception-quality/1",
+    );
+    await expect(page.locator("#report-context-text")).toHaveText(context);
+    await expect(page.locator("#investigation-report img")).toHaveCount(0);
+    const frozenLabel = await page.locator("#report-snapshot").textContent();
+    const draft = "Hypothèse à affiner au prochain passage";
+    await page.locator("#investigation-context").fill(draft);
+    await expect
+      .poll(async () =>
+        Number(await page.locator("#sample-value").textContent()),
+      )
+      .toBeGreaterThan(report.snapshot.sample_count + 5);
+    await expect(page.locator("#report-snapshot")).toHaveText(frozenLabel);
+    await expect(page.locator("#investigation-context")).toHaveValue(draft);
+    await expect(page.locator("#investigation-history")).toHaveValue(report.id);
+
+    const referencedIds = report.findings.flatMap(
+      (finding) => finding.evidence,
+    );
+    const evidenceIndex = report.evidence.findIndex(
+      (item) => referencedIds.includes(item.id) && item.window_s,
+    );
+    expect(evidenceIndex).toBeGreaterThanOrEqual(0);
+    const evidence = report.evidence[evidenceIndex];
+    await page
+      .getByRole("button", { name: `Preuve · ${evidence.title}`, exact: true })
+      .first()
+      .click();
+    await expect(page.locator("#window-start")).toHaveValue(
+      String(evidence.window_s.start_s),
+    );
+    await expect(page.locator("#window-end")).toHaveValue(
+      String(evidence.window_s.end_s),
+    );
+    await expect(
+      page.locator(`#report-evidence-${evidenceIndex}`),
+    ).toHaveAttribute("open", "");
+    await expect(
+      page.locator(`#report-evidence-${evidenceIndex} pre`),
+    ).toHaveText(JSON.stringify(evidence.data, null, 2));
+    await expect(page.locator("#report-snapshot")).toHaveText(frozenLabel);
+    await page.locator("#stop-button").click();
+    await expect(page.locator("#stop-button")).toBeHidden();
+    await page.reload();
+    await expect(page.locator("#investigation-history")).toHaveValue(report.id);
+    await expect(page.locator("#report-summary")).toHaveText(report.summary);
+    await expect(page.locator("#report-context-text")).toHaveText(context);
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.locator("#investigation-export").click(),
+    ]);
+    const exported = JSON.parse(await readFile(await download.path(), "utf8"));
+    expect(exported).toEqual(report);
+    await page.locator(".report-context summary").click();
+    await page.locator("#reuse-report-context").click();
+    await expect(page.locator("#investigation-context")).toHaveValue(context);
+    await page
+      .locator(".investigation-panel")
+      .screenshot({ path: "test-results/investigation-desktop.png" });
+    await page.setViewportSize({ width: 390, height: 844 });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(390);
+    await page
+      .locator(".investigation-panel")
+      .screenshot({ path: "test-results/investigation-mobile.png" });
+    expect(errors).toEqual([]);
+  } finally {
+    if (sessionId) {
+      const detail = await (
+        await page.request.get(`/api/sessions/${sessionId}`)
+      ).json();
+      if (detail.session.status === "live")
+        await page.request.post(`/api/sessions/${sessionId}/stop`, {
+          data: {},
+        });
+    }
+  }
+});
+
+test("late investigation responses cannot replace another window or session selection", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.locator("#active-session-title")).toHaveText(
+    "Investigation de réception synthétique",
+  );
+  await expect(page.locator("#investigation-report")).toBeVisible();
+  const previousId = await page.locator("#investigation-history").inputValue();
+  const previousSummary = await page.locator("#report-summary").textContent();
+  const sessions = await (await page.request.get("/api/sessions")).json();
+  const sessionId = sessions.find(
+    (session) => session.name === "Investigation de réception synthétique",
+  ).id;
+  let releasePost;
+  let postFetched;
+  const postResponseReady = new Promise((resolve) => {
+    postFetched = resolve;
+  });
+  const postGate = new Promise((resolve) => {
+    releasePost = resolve;
+  });
+  const collectionUrl = `**/api/sessions/${sessionId}/investigations`;
+  await page.route(collectionUrl, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    postFetched();
+    await postGate;
+    await route.fulfill({ response });
+  });
+  try {
+    await page
+      .locator("#investigation-context")
+      .fill("Rapport demandé avant changement de fenêtre");
+    await page.locator("#investigate-button").click();
+    await postResponseReady;
+    await page.locator("#window-start").fill("0.123456789");
+    await page.locator("#window-end").fill("0.987654321");
+    await page
+      .locator("#window-form")
+      .getByRole("button", { name: "Appliquer" })
+      .click();
+    await expect(page.locator("#window-start")).toHaveValue("0.123456789");
+    releasePost();
+    await expect(page.locator("#investigation-status")).toContainText(
+      "fenêtre demandée au lancement",
+    );
+    await expect(page.locator("#investigation-history option")).toHaveCount(3);
+    await expect(page.locator("#investigation-history")).toHaveValue(
+      previousId,
+    );
+    await expect(page.locator("#report-summary")).toHaveText(previousSummary);
+  } finally {
+    releasePost();
+    await page.unroute(collectionUrl);
+  }
+
+  const otherId = await page
+    .locator("#investigation-history option")
+    .evaluateAll(
+      (options, previous) =>
+        options.find((option) => option.value && option.value !== previous)
+          .value,
+      previousId,
+    );
+  let releaseGet;
+  let getFetched;
+  const getResponseReady = new Promise((resolve) => {
+    getFetched = resolve;
+  });
+  const getGate = new Promise((resolve) => {
+    releaseGet = resolve;
+  });
+  const reportUrl = `**/api/sessions/${sessionId}/investigations/${otherId}`;
+  await page.route(reportUrl, async (route) => {
+    const response = await route.fetch();
+    getFetched();
+    await getGate;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.locator("#investigation-history").selectOption(otherId);
+    await getResponseReady;
+    await page
+      .locator(".session-item")
+      .filter({ hasText: "Réception au banc" })
+      .click();
+    await expect(page.locator("#active-session-title")).toHaveText(
+      "Réception au banc",
+    );
+    await expect(page.locator("#investigation-status")).toContainText(
+      "Aucune investigation",
+    );
+    releaseGet();
+    await expect(page.locator("#investigation-report")).toBeHidden();
+    await expect(page.locator("#investigation-history option")).toHaveCount(1);
+  } finally {
+    releaseGet();
+    await page.unroute(reportUrl);
+  }
+});

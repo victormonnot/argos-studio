@@ -16,6 +16,13 @@ const state = {
   busy: new Set(),
   connectionFailed: false,
   chart: null,
+  investigations: [],
+  report: null,
+  investigationDrafts: new Map(),
+  investigationSessionRevision: 0,
+  investigationListRevision: 0,
+  reportRevision: 0,
+  investigationLoading: false,
 };
 const number = (value, digits = 1) =>
   Number.isFinite(value)
@@ -177,6 +184,7 @@ function renderControls() {
   $("play-button").disabled = !hasSamples;
   $("replay-cursor").disabled = !hasSamples;
   $("live-button").disabled = !hasSamples;
+  renderInvestigationControls();
 }
 function renderSessions() {
   text("session-count", state.sessions.length);
@@ -215,6 +223,15 @@ async function loadSessions() {
 async function selectSession(id) {
   pausePlayback();
   state.id = id;
+  state.investigationSessionRevision += 1;
+  state.reportRevision += 1;
+  state.investigations = [];
+  state.report = null;
+  state.investigationLoading = false;
+  $("investigation-context").value = state.investigationDrafts.get(id) ?? "";
+  $("investigation-report").hidden = true;
+  setInvestigationStatus("Chargement des rapports enregistrés…");
+  renderInvestigationHistory();
   state.generation += 1;
   state.start = null;
   state.end = null;
@@ -227,7 +244,10 @@ async function selectSession(id) {
   $("empty-state").hidden = true;
   clearError();
   renderSessions();
-  await refreshSelection();
+  await Promise.all([
+    refreshSelection(),
+    loadInvestigations(id, state.investigationSessionRevision, true),
+  ]);
 }
 async function refreshSelection() {
   if (!state.id || state.inFlight === state.generation) return;
@@ -704,9 +724,8 @@ async function setWindow(start, end) {
   state.end = end;
   state.generation += 1;
   state.follow = true;
-  $("window-start").value =
-    start === null ? "" : String(Number(start.toFixed(3)));
-  $("window-end").value = end === null ? "" : String(Number(end.toFixed(3)));
+  $("window-start").value = start === null ? "" : String(start);
+  $("window-end").value = end === null ? "" : String(end);
   await refreshSelection();
 }
 function pausePlayback() {
@@ -946,3 +965,379 @@ setInterval(async () => {
   }
 }, 500);
 initialize();
+
+function setInvestigationStatus(message, error = false) {
+  text("investigation-status", message);
+  $("investigation-status").classList.toggle("is-error", error);
+}
+function renderInvestigationControls() {
+  const busy = state.busy.has("investigate");
+  $("investigate-button").disabled =
+    !state.detail || busy || state.investigationLoading;
+  $("investigate-button").textContent = busy
+    ? "Investigation en cours…"
+    : "Investiguer cette fenêtre";
+  $("investigation-history").disabled =
+    !state.investigations.length || busy || state.investigationLoading;
+  $("investigation-export").disabled =
+    !state.report ||
+    state.investigationLoading ||
+    state.busy.has("investigation-export");
+  $("reuse-report-context").disabled = !state.report;
+  const start = state.start === null ? "début de session" : `${state.start} s`;
+  const end =
+    state.end === null ? "dernière observation au lancement" : `${state.end} s`;
+  text(
+    "investigation-window-label",
+    `Fenêtre demandée : ${start} → ${end}. Le rapport conservera un instantané fixe.`,
+  );
+}
+function renderInvestigationHistory() {
+  const placeholder = element(
+    "option",
+    "",
+    state.investigations.length
+      ? "Choisir un rapport enregistré"
+      : "Aucun rapport enregistré",
+  );
+  placeholder.value = "";
+  const options = state.investigations.map((report) => {
+    const option = element(
+      "option",
+      "",
+      `${formatDate(report.created_at)} · ${seconds(report.window_s?.start_s)} → ${seconds(report.window_s?.end_s)} · ${report.summary}`,
+    );
+    option.value = report.id;
+    return option;
+  });
+  $("investigation-history").replaceChildren(placeholder, ...options);
+  $("investigation-history").value = state.report?.id ?? "";
+  renderInvestigationControls();
+}
+async function loadInvestigations(
+  sessionId,
+  sessionRevision,
+  selectLatest = false,
+) {
+  const listRevision = ++state.investigationListRevision;
+  try {
+    const reports = await api(sessionPath("/investigations", sessionId));
+    if (
+      sessionRevision !== state.investigationSessionRevision ||
+      listRevision !== state.investigationListRevision
+    )
+      return;
+    state.investigations = reports;
+    renderInvestigationHistory();
+    if (selectLatest && reports.length)
+      await selectInvestigation(reports[0].id);
+    else if (!reports.length)
+      setInvestigationStatus("Aucune investigation lancée pour cette session.");
+  } catch (error) {
+    if (
+      sessionRevision === state.investigationSessionRevision &&
+      listRevision === state.investigationListRevision
+    ) {
+      setInvestigationStatus(error.message, true);
+    }
+  }
+}
+async function selectInvestigation(reportId) {
+  if (!reportId) return;
+  const sessionId = state.id;
+  const sessionRevision = state.investigationSessionRevision;
+  const revision = ++state.reportRevision;
+  state.investigationLoading = true;
+  setInvestigationStatus("Chargement du rapport…");
+  renderInvestigationControls();
+  try {
+    const report = await api(
+      sessionPath(`/investigations/${encodeURIComponent(reportId)}`, sessionId),
+    );
+    if (
+      sessionRevision !== state.investigationSessionRevision ||
+      revision !== state.reportRevision
+    )
+      return;
+    state.report = report;
+    renderInvestigationReport();
+    setInvestigationStatus(
+      "Rapport enregistré : les nouvelles mesures et les changements de fenêtre ne le modifient pas.",
+    );
+  } catch (error) {
+    if (
+      sessionRevision === state.investigationSessionRevision &&
+      revision === state.reportRevision
+    ) {
+      setInvestigationStatus(error.message, true);
+      $("investigation-history").value = state.report?.id ?? "";
+    }
+  } finally {
+    if (
+      sessionRevision === state.investigationSessionRevision &&
+      revision === state.reportRevision
+    ) {
+      state.investigationLoading = false;
+      renderInvestigationControls();
+    }
+  }
+}
+function reportList(title, values, className) {
+  const section = element("section", className);
+  section.append(element("h5", "", title));
+  const list = element("ul");
+  list.append(...values.map((value) => element("li", "", value)));
+  section.append(list);
+  return section;
+}
+async function showReportEvidence(evidence, index, showChart = false) {
+  const reportId = state.report?.id;
+  const sessionRevision = state.investigationSessionRevision;
+  if (evidence.window_s)
+    await setWindow(evidence.window_s.start_s, evidence.window_s.end_s);
+  if (
+    reportId !== state.report?.id ||
+    sessionRevision !== state.investigationSessionRevision
+  )
+    return;
+  const details = $(`report-evidence-${index}`);
+  if (!details) return;
+  details.open = true;
+  const target = showChart ? $("signal-title") : details;
+  target.scrollIntoView({ block: "nearest", behavior: "auto" });
+}
+function renderInvestigationReport() {
+  const report = state.report;
+  if (!report) return;
+  $("investigation-report").hidden = false;
+  text("report-summary", report.summary);
+  text("report-version", report.algorithm_version);
+  text(
+    "report-outcome",
+    {
+      insufficient_data: "Données insuffisantes",
+      observations: "Observations à examiner",
+      no_gap_observed: "Aucune interruption observée",
+    }[report.outcome] ?? "Rapport de réception",
+  );
+  text(
+    "report-snapshot",
+    `Rapport figé le ${formatDate(report.created_at)} · fenêtre ${report.window_s.start_s} → ${report.window_s.end_s} s · ${report.snapshot.sample_count} échantillons, ${report.snapshot.datagram_count ?? 0} datagrammes, ${report.snapshot.event_count} événements · source : ${sourceLabel({ source: report.snapshot.source })}.`,
+  );
+  text(
+    "report-context-text",
+    report.context || "Aucun contexte fourni pour ce rapport.",
+  );
+  text(
+    "report-fingerprint",
+    `Empreinte SHA-256 des données analysées : ${report.snapshot.sha256}`,
+  );
+  $("investigation-history").value = report.id;
+  const evidence = report.evidence ?? [];
+  const findings = (report.findings ?? []).map((finding) => {
+    const card = element("section", "report-finding");
+    card.append(
+      element("h4", "", finding.title),
+      element("p", "finding-observation", finding.observation),
+    );
+    const links = element("div", "finding-evidence-links");
+    for (const evidenceId of finding.evidence ?? []) {
+      const index = evidence.findIndex((item) => item.id === evidenceId);
+      if (index < 0) continue;
+      const item = evidence[index];
+      const button = element(
+        "button",
+        "report-evidence-link",
+        `Preuve · ${item.title}`,
+      );
+      button.type = "button";
+      button.addEventListener("click", () => showReportEvidence(item, index));
+      links.append(button);
+    }
+    card.append(links);
+    const interpretation = element("div", "finding-interpretation");
+    if (finding.hypotheses?.length)
+      interpretation.append(
+        reportList(
+          "Hypothèses à vérifier",
+          finding.hypotheses,
+          "finding-hypotheses",
+        ),
+      );
+    if (finding.uncertainties?.length)
+      interpretation.append(
+        reportList(
+          "Ce qui reste incertain",
+          finding.uncertainties,
+          "finding-uncertainties",
+        ),
+      );
+    card.append(interpretation);
+    if (finding.next_check) {
+      const check = element("section", "finding-next-check");
+      check.append(
+        element("p", "eyebrow", "VÉRIFICATION PROPOSÉE · NON EXÉCUTÉE"),
+        element("h5", "", finding.next_check.title),
+      );
+      const steps = element("ol");
+      steps.append(
+        ...(finding.next_check.steps ?? []).map((step) =>
+          element("li", "", step),
+        ),
+      );
+      check.append(
+        steps,
+        element(
+          "p",
+          "expected-evidence",
+          `Preuve attendue : ${finding.next_check.expected_evidence}`,
+        ),
+      );
+      card.append(check);
+    }
+    return card;
+  });
+  if (!findings.length)
+    findings.push(
+      element(
+        "p",
+        "small muted",
+        "Aucun constat supplémentaire dans ce rapport.",
+      ),
+    );
+  $("report-findings").replaceChildren(...findings);
+  const evidenceNodes = evidence.map((item, index) => {
+    const details = element("details", "report-evidence-item");
+    details.id = `report-evidence-${index}`;
+    details.append(element("summary", "", `${item.id} · ${item.title}`));
+    if (item.window_s) {
+      details.append(
+        element(
+          "p",
+          "evidence-window",
+          `Bornes exactes : ${item.window_s.start_s} → ${item.window_s.end_s} s`,
+        ),
+      );
+      const button = element(
+        "button",
+        "button compact subtle evidence-window-button",
+        "Afficher cette fenêtre",
+      );
+      button.type = "button";
+      button.addEventListener("click", () =>
+        showReportEvidence(item, index, true),
+      );
+      details.append(button);
+    }
+    details.append(
+      element("pre", "evidence-data", JSON.stringify(item.data, null, 2)),
+    );
+    return details;
+  });
+  if (!evidenceNodes.length)
+    evidenceNodes.push(
+      element("p", "small muted", "Aucune pièce de preuve disponible."),
+    );
+  $("report-evidence").replaceChildren(...evidenceNodes);
+  $("report-limitations").replaceChildren(
+    ...(report.limitations ?? []).map((limit) => element("li", "", limit)),
+  );
+  $("report-tools").replaceChildren(
+    ...(report.tools ?? []).map((tool) => {
+      const details = element("details");
+      details.append(
+        element("summary", "", tool.name),
+        element(
+          "pre",
+          "evidence-data",
+          JSON.stringify(
+            { parameters: tool.parameters, result: tool.result },
+            null,
+            2,
+          ),
+        ),
+      );
+      return details;
+    }),
+  );
+  renderInvestigationControls();
+}
+$("investigation-context").addEventListener("input", () => {
+  if (state.id)
+    state.investigationDrafts.set(state.id, $("investigation-context").value);
+});
+$("investigation-history").addEventListener("change", () =>
+  selectInvestigation($("investigation-history").value),
+);
+$("reuse-report-context").addEventListener("click", () => {
+  if (!state.report) return;
+  $("investigation-context").value = state.report.context ?? "";
+  state.investigationDrafts.set(state.id, $("investigation-context").value);
+  $("investigation-context").focus();
+});
+$("investigation-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.detail || state.busy.has("investigate")) return;
+  const sessionId = state.id;
+  const sessionRevision = state.investigationSessionRevision;
+  const generation = state.generation;
+  const reportRevision = ++state.reportRevision;
+  const payload = {
+    start_s: state.start,
+    end_s: state.end,
+    context: $("investigation-context").value,
+  };
+  state.busy.add("investigate");
+  setInvestigationStatus("Examen des observations et conservation du rapport…");
+  renderInvestigationControls();
+  try {
+    const report = await post(
+      sessionPath("/investigations", sessionId),
+      payload,
+    );
+    if (sessionRevision !== state.investigationSessionRevision) return;
+    await loadInvestigations(sessionId, sessionRevision);
+    if (sessionRevision !== state.investigationSessionRevision) return;
+    if (
+      generation === state.generation &&
+      reportRevision === state.reportRevision
+    ) {
+      state.report = report;
+      renderInvestigationReport();
+      setInvestigationStatus(
+        "Rapport enregistré : les nouvelles mesures et les changements de fenêtre ne le modifient pas.",
+      );
+    } else
+      setInvestigationStatus(
+        "Rapport enregistré pour la fenêtre demandée au lancement. Retrouvez-le dans l’historique.",
+      );
+  } catch (error) {
+    if (sessionRevision === state.investigationSessionRevision)
+      setInvestigationStatus(error.message, true);
+  } finally {
+    state.busy.delete("investigate");
+    renderInvestigationControls();
+  }
+});
+$("investigation-export").addEventListener("click", () => {
+  if (!state.report) return;
+  const report = state.report;
+  action("investigation-export", async () => {
+    const data = await api(
+      sessionPath(
+        `/investigations/${encodeURIComponent(report.id)}/export`,
+        report.session_id,
+      ),
+    );
+    const url = URL.createObjectURL(
+      new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
+    );
+    const link = element("a");
+    link.href = url;
+    link.download = `argos-studio-investigation-${report.id}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+});
