@@ -7,8 +7,9 @@ Record a local MAVLink/SITL stream or a synthetic attitude source, attach
 observations, inspect reception gaps and replay the retained evidence. An
 optional adapter imports existing ARGOS recordings through their native
 validator. Versioned reception investigations retain findings, evidence and
-proposed checks across sessions. The interface is currently in French; source code and technical
-documentation are in English.
+proposed checks across sessions. A bounded synthetic experiment can compare an
+unperturbed control with a deliberate interruption. The interface is currently
+in French; source code and technical documentation are in English.
 
 ## Run locally
 
@@ -50,7 +51,10 @@ on your own computer.
 6. In **Investigation de réception**, optionally record a working hypothesis,
    then select **Investiguer cette fenêtre**. Open a finding's evidence to
    inspect its exact measurement pair and return to that window in the chart.
-   Reopen saved reports from the history or export a report as JSON.
+  Reopen saved reports from the history or export a report as JSON.
+7. From a synthetic report, prepare the comparison protocol, then launch it.
+   Inspect the control and interrupted captures, their comparison and the
+   referenced interval. The original session and report remain unchanged.
 
 The generated angles follow deterministic mathematical signals. They do not model
 flight dynamics or sensor performance. A requested two-second interruption and
@@ -82,8 +86,8 @@ tools; other message types remain in their original recording and are not
 correlated by this version.
 
 Reports are **deterministic and do not use a language model**. The optional context
-is retained as user-supplied text, without automatic interpretation. Suggested
-checks are recorded, not executed. A changed hypothesis or new observations can
+is retained as user-supplied text, without automatic interpretation. Creating a
+report does not execute its suggested checks. A changed hypothesis or new observations can
 be examined by creating another report; existing reports remain unchanged.
 
 The snapshot ends at the persisted session duration, which can lag current time
@@ -97,6 +101,54 @@ authenticity. The snapshot stores the original session fields and last sample,
 datagram and event identifiers, so its input can be reconstructed after later
 acquisition or annotations. Evidence excerpts are embedded in the report;
 complete UDP bytes remain in the separate raw capture export.
+
+## Execute a synthetic comparison
+
+Open a report from a **Simulation synthétique** session and prepare an experiment.
+The proposal records a fixed protocol and its originating report. Preparation
+does not start acquisition. Read the protocol, stop any existing acquisition,
+and use the separate launch action. A proposal expires after ten minutes and
+can start only once; repeating a finished or cancelled experiment requires a new
+proposal. Reports from MAVLink captures and imported recordings cannot launch
+this protocol.
+
+| Phase | Duration | Source | Intervention |
+| --- | --- | --- | --- |
+| Control | 6 seconds | Synthetic attitude, nominal 20 Hz | None |
+| Perturbed | 6 seconds | Same generator and cadence | Suspend for 2 seconds at approximately t = 2 s |
+
+The executor creates two ordinary replayable sessions, linked to the proposal
+and its original investigation. It reserves acquisition across both phases;
+another session, import or manual interruption cannot interleave with the
+protocol. A global progress panel keeps cancellation accessible even when a
+different session is selected. Cancelling, or stopping an experiment's active
+capture, stops the sequence and retains its partial evidence. Server shutdown
+marks an active experiment interrupted; a process restart never resumes it.
+Each generator phase stops itself after six seconds, and the orchestrator has a
+20-second monotonic deadline. These are local software bounds for a synthetic
+source, not a physical failsafe or hard real-time guarantee.
+
+The comparison checks source/generator identity, nominal and observed cadence,
+completed captures, coverage at both edges, and at least 80% of the nominal
+sample count outside the suspension. The control must have no interruption;
+the perturbed capture must contain one recorded suspension and resumption. The
+expected response is one measured gap encompassing those events, between 2 and
+2.35 seconds for this protocol. Timing tolerance is 0.25 seconds and cadence
+tolerance is ±20%; these are declared comparison criteria, not inferred vehicle
+requirements. The interface shows which conditions pass or fail.
+
+A supported result means the controlled synthetic response was observed. An
+incomplete or non-comparable capture yields an inconclusive result; usable
+captures with a different response report that it was not reproduced. The
+comparison also references the original report and the difference in gap
+duration. Similar durations do not establish a common cause. A single pair of
+captures does not establish repeatability, sensor latency or hardware behavior.
+
+Completed and interrupted experiments remain in the history, with links to
+their original report and both captures. Export their protocol, lifecycle and
+comparison as JSON; each linked session has its own full measurement export.
+No language model, simulator binary or vehicle connection is involved in this
+synthetic protocol.
 
 ## Receive a local MAVLink/SITL stream
 
@@ -187,8 +239,8 @@ capture date is retained as metadata without assuming clock synchronization.
 ## Data and limits
 
 Data is stored in the ignored `.data/` directory by default: a SQLite database
-for sessions, samples, events, investigations and raw UDP datagrams, and `recordings/` for
-imported originals.
+for sessions, samples, events, investigations, experiments and raw UDP datagrams,
+and `recordings/` for imported originals.
 `ARGOS_STUDIO_DATA_DIR` also selects the directory. An interrupted acquisition is
 retained and marked as interrupted when the application restarts. Earlier Studio
 databases are migrated transactionally at startup, preserving existing sessions.
@@ -209,6 +261,8 @@ the separate capture export includes every retained datagram's bytes.
 | Imported recording | 10 MiB and 100,000 native events |
 | Native import validation | 20 seconds |
 | Investigations per session | 50 immutable reports, up to 4 MiB each |
+| Experiment proposals per originating session | 20; protocol up to 64 KiB, result up to 4 MiB |
+| Synthetic experiment | Two 6-second captures; 20-second execution deadline; 10-minute proposal expiry |
 
 There is no automatic deletion or total disk quota. When the session limit is
 reached, retain the existing directory and start with another data directory.
@@ -228,6 +282,8 @@ integrated UAV Debugger/Meridian modules are outside this version.
 | [`mavlink.py`](src/argos_studio/mavlink.py) | Receive-only UDP, decoding, source selection and freshness |
 | [`acquisition.py`](src/argos_studio/acquisition.py) | Route session operations to the active source |
 | [`investigation.py`](src/argos_studio/investigation.py) | Snapshot-based reception tools, evidence references and versioned reports |
+| [`experiments.py`](src/argos_studio/experiments.py) | Consume a proposal once, execute two bounded synthetic captures and retain outcomes |
+| [`comparison.py`](src/argos_studio/comparison.py) | Check comparability, link intervention evidence and compare measured receipt intervals |
 | [`app.py`](src/argos_studio/app.py) | Local FastAPI endpoints, process ownership and HTTP boundaries |
 | [`argos_import.py`](src/argos_studio/argos_import.py) | Optional subprocess adapter to ARGOS's native recording reader |
 | [`static/`](src/argos_studio/static/) | Browser interface, charts, timeline and replay without a build step |
@@ -246,6 +302,11 @@ and response routes. Key endpoints are:
 | `GET /api/sessions/{id}/analysis` | Evidence for a selected reception-time window |
 | `GET` / `POST /api/sessions/{id}/investigations` | List reports or investigate a window with optional context |
 | `GET /api/sessions/{id}/investigations/{report_id}` | Read a saved report; append `/export` to download JSON |
+| `POST /api/sessions/{id}/investigations/{report_id}/experiments` | Prepare the fixed synthetic comparison protocol |
+| `GET /api/experiments` | List experiments; optional originating `session_id` filter |
+| `GET /api/experiments/{experiment_id}` | Inspect proposal, status, linked captures and comparison |
+| `POST /api/experiments/{experiment_id}/start` / `cancel` | Start a valid proposal once, or cancel the sequence |
+| `GET /api/experiments/{experiment_id}/export` | Export a terminal experiment and its result |
 | `GET /api/sessions/{id}/export` / `raw` | Export session JSON or retrieve an imported original |
 | `GET /api/sessions/{id}/capture` | Export a stopped MAVLink session's raw UDP evidence |
 | `POST /api/import/argos` | Validate and import a native recording |
@@ -255,6 +316,11 @@ Writes use JSON, except the import endpoint, which accepts
 Investigation requests accept `start_s`, `end_s` and `context` (up to 2,000
 characters). Omitted bounds select the whole persisted session; explicit bounds
 must be finite, ordered and within its recorded duration. All tools run locally.
+Experiment preparation, start and cancellation accept only `{}`. Protocols are
+defined by the server; arbitrary sources, durations or executable actions are
+not accepted in these requests. Starting returns HTTP 202 and reserves two
+session slots. Inspect status with GET; incompatible, expired, already-consumed
+or busy launches return HTTP 409 without acquiring a new source.
 
 ## Verify changes
 
@@ -279,8 +345,8 @@ npm run test:e2e
 
 The browser suite starts its own server on port 8766 with a temporary data
 directory. It exercises capture, annotation, interruption evidence, export,
-replay, investigations, report history/export, mobile layout and connection errors
-without touching saved sessions.
+replay, investigations, report history/export, synthetic experiment completion
+and cancellation, mobile layout and connection errors without touching saved sessions.
 
 ## Optional isolated SITL check
 

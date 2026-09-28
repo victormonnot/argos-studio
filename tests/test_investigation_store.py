@@ -255,7 +255,8 @@ def test_version_one_migration_preserves_capture_and_adds_report_storage(store):
     store.annotate(session["id"], "Before migration", 1)
     store.finish_session(session["id"], status="interrupted", elapsed_s=2)
     with store._connection() as connection:
-        # Remove only v2 objects to recreate the exact prior version's schema.
+        # Remove later objects to recreate the exact prior version's schema.
+        connection.execute("DROP TABLE experiments")
         connection.execute("DROP TABLE investigations")
         connection.execute("PRAGMA user_version=1")
         before = {
@@ -264,7 +265,7 @@ def test_version_one_migration_preserves_capture_and_adds_report_storage(store):
         }
     migrated = Store(store.path)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         for table, rows in before.items():
@@ -280,6 +281,7 @@ def test_additive_migration_failure_keeps_version_one_and_original_capture(store
     store.append_datagram(session["id"], **packet(1))
     before = store.datagrams(session["id"])
     with store._connection() as connection:
+        connection.execute("DROP TABLE experiments")
         connection.execute("DROP TABLE investigations")
         connection.execute("PRAGMA user_version=1")
     # A preexisting orphan should be reported without committing the new table.

@@ -120,7 +120,7 @@ class StoreTests(unittest.TestCase):
             }
         migrated = Store(path)
         with migrated._connection() as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             for table, expected in before.items():

@@ -5,7 +5,7 @@ import fcntl
 import json
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -18,7 +18,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .acquisition import Acquisition
 from .argos_import import read_argos_recording
-from .core import MAX_INVESTIGATIONS, Store
+from .core import MAX_EXPERIMENTS, MAX_INVESTIGATIONS, Store
+from .experiments import PROPOSAL_TTL_S, ExperimentRunner, SyntheticProtocol
 from .investigation import ALGORITHM_VERSION, investigate
 from .mavlink import MAX_DATAGRAMS, MAX_RAW_BYTES, MAX_SAMPLES, dialect
 
@@ -42,6 +43,7 @@ class Settings:
     period_s: float = 0.05
     max_duration_s: float = MAX_DURATION_S
     dropout_duration_s: float = 2
+    experiment_protocol: SyntheticProtocol = field(default_factory=SyntheticProtocol)
 
     def import_available(self) -> bool:
         if not self.argos_root or not self.argos_python:
@@ -80,6 +82,10 @@ class Investigation(BaseModel):
     context: str = Field(default="", max_length=2000)
 
 
+class EmptyAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 Bound = Annotated[float | None, Query(ge=0, allow_inf_nan=False)]
 
 
@@ -99,6 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ) from exc
             store = Store(settings.data_dir / "studio.sqlite3")
             store.recover_interrupted()
+            store.recover_experiments()
             runtime = Acquisition(
                 store,
                 period_s=settings.period_s,
@@ -108,9 +115,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.store = store
             app.state.runtime = runtime
             app.state.creation_lock = asyncio.Lock()
+            runner = ExperimentRunner(
+                store,
+                runtime,
+                app.state.creation_lock,
+                protocol=settings.experiment_protocol,
+                max_sessions=MAX_SESSIONS,
+            )
+            app.state.experiments = runner
             try:
                 yield
             finally:
+                await runner.close()
                 if runtime.active:
                     await runtime.stop(runtime.session_id, status="interrupted")
                 fcntl.flock(lock, fcntl.LOCK_UN)
@@ -172,6 +188,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 409, "Limite de 100 sessions atteinte. Utilisez un autre dossier de données."
             )
 
+    def available_acquisition() -> None:
+        if app.state.experiments.active:
+            raise HTTPException(409, "Terminez ou annulez l’essai synthétique en cours.")
+
     @app.get("/api/health")
     def health():
         available = settings.import_available()
@@ -201,8 +221,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "max_import_bytes": MAX_IMPORT_BYTES,
                 "max_sessions": MAX_SESSIONS,
                 "max_investigations_per_session": MAX_INVESTIGATIONS,
+                "max_experiments_per_session": MAX_EXPERIMENTS,
             },
             "investigation": {"algorithm_version": ALGORITHM_VERSION, "uses_llm": False},
+            "experiment": {
+                "active_id": app.state.experiments.experiment_id
+                if app.state.experiments.active
+                else None,
+                "profile": asdict(settings.experiment_protocol),
+                "proposal_ttl_s": PROPOSAL_TTL_S,
+            },
         }
 
     @app.get("/api/sessions")
@@ -212,6 +240,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/sessions", status_code=201)
     async def start_session(body: StartSession):
         async with app.state.creation_lock:
+            available_acquisition()
             capacity()
             return await app.state.runtime.start(**body.model_dump())
 
@@ -233,10 +262,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str):
+        if app.state.experiments.owns(session_id):
+            await app.state.experiments.cancel(app.state.experiments.experiment_id)
+            return app.state.store.get_session(session_id)
         return await app.state.runtime.stop(session_id)
 
     @app.post("/api/sessions/{session_id}/dropout")
     async def dropout(session_id: str):
+        if app.state.experiments.owns(session_id):
+            raise HTTPException(409, "L’interruption est pilotée par le protocole de cet essai.")
         return await app.state.runtime.dropout(session_id)
 
     @app.get("/api/sessions/{session_id}/analysis")
@@ -265,6 +299,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
             },
+        )
+
+    @app.post(
+        "/api/sessions/{session_id}/investigations/{investigation_id}/experiments", status_code=201
+    )
+    def propose_experiment(session_id: str, investigation_id: str, body: EmptyAction):
+        return app.state.experiments.propose(session_id, investigation_id)
+
+    @app.get("/api/experiments")
+    def list_experiments(session_id: str | None = None):
+        return app.state.store.list_experiments(session_id)
+
+    @app.get("/api/experiments/{experiment_id}")
+    def get_experiment(experiment_id: str):
+        return app.state.store.get_experiment(experiment_id)
+
+    @app.post("/api/experiments/{experiment_id}/start", status_code=202)
+    async def start_experiment(experiment_id: str, body: EmptyAction):
+        try:
+            return await app.state.experiments.start(experiment_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/experiments/{experiment_id}/cancel")
+    async def cancel_experiment(experiment_id: str, body: EmptyAction):
+        return await app.state.experiments.cancel(experiment_id)
+
+    @app.get("/api/experiments/{experiment_id}/export")
+    def export_experiment(experiment_id: str):
+        experiment = app.state.store.get_experiment(experiment_id)
+        if experiment["status"] in {"proposed", "running"}:
+            raise HTTPException(409, "Terminez ou annulez l’essai avant d’exporter son résultat.")
+        filename = f"argos-experiment-{experiment['id']}.json"
+        return Response(
+            json.dumps(experiment, ensure_ascii=False, allow_nan=False),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     @app.get("/api/sessions/{session_id}/export")
@@ -324,6 +395,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if len(data) > MAX_IMPORT_BYTES:
                 raise HTTPException(413, "Enregistrement trop volumineux (maximum 10 Mio).")
         async with app.state.creation_lock:
+            available_acquisition()
             capacity()
             if app.state.runtime.active:
                 raise HTTPException(

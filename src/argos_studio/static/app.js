@@ -23,6 +23,14 @@ const state = {
   investigationListRevision: 0,
   reportRevision: 0,
   investigationLoading: false,
+  experiments: [],
+  experimentId: null,
+  experimentRevision: 0,
+  experimentsInFlight: false,
+  experimentsLoaded: false,
+  experimentRendered: null,
+  experimentsHistoryRendered: null,
+  experimentsFailed: false,
 };
 const number = (value, digits = 1) =>
   Number.isFinite(value)
@@ -135,6 +143,13 @@ function renderControls() {
   const session = state.detail?.session;
   const live = session?.status === "live";
   const anyLive = state.sessions.some((item) => item.status === "live");
+  const experimentActive = activeExperiment();
+  const experimentChild =
+    experimentActive &&
+    [
+      experimentActive.control_session_id,
+      experimentActive.perturbed_session_id,
+    ].includes(session?.id);
   const mavlinkSelected = $("source-kind").value === "mavlink-udp";
   const mavlinkAvailable = state.health?.mavlink?.available === true;
   $("source-kind").querySelector('option[value="mavlink-udp"]').disabled =
@@ -142,14 +157,20 @@ function renderControls() {
   $("source-kind").disabled = state.busy.has("start");
   $("start-button").disabled =
     anyLive ||
+    experimentActive ||
     state.busy.has("start") ||
     (mavlinkSelected && !mavlinkAvailable);
   renderSourceSettings();
-  $("start-button").title = anyLive
-    ? "Arrêtez la session active avant de démarrer un nouvel essai."
-    : "";
+  $("start-button").title = experimentActive
+    ? "L’expérience conserve deux acquisitions successives. Attendez sa fin ou annulez-la."
+    : anyLive
+      ? "Arrêtez la session active avant de démarrer un nouvel essai."
+      : "";
   $("stop-button").hidden = !live;
   $("stop-button").disabled = !live || state.busy.has("stop");
+  $("stop-button").textContent = experimentChild
+    ? "Annuler l’expérience"
+    : "Arrêter la session";
   $("experiment-panel").hidden = session?.source !== "simulation";
   $("capture-button").hidden = session?.source !== "mavlink-udp";
   $("capture-button").disabled = !session || live || state.busy.has("capture");
@@ -158,6 +179,7 @@ function renderControls() {
     : "Télécharger les datagrammes conservés et leurs métadonnées.";
   $("dropout-button").disabled =
     !live ||
+    experimentChild ||
     session?.source !== "simulation" ||
     state.detail?.live?.gap_active ||
     state.busy.has("dropout");
@@ -167,17 +189,22 @@ function renderControls() {
   $("export-button").disabled = !session || state.busy.has("export");
   $("import-file").disabled =
     !state.health?.argos_import?.available ||
+    experimentActive ||
     anyLive ||
     state.busy.has("import");
-  $("import-file").title = anyLive
-    ? "Arrêtez la session active avant un import."
-    : "";
+  $("import-file").title = experimentActive
+    ? "Attendez la fin de l’expérience ou annulez-la avant un import."
+    : anyLive
+      ? "Arrêtez la session active avant un import."
+      : "";
   if (state.health?.argos_import?.available) {
     text(
       "import-status",
-      anyLive
-        ? "Arrêtez la session active pour importer un enregistrement."
-        : "Adaptateur ARGOS disponible. Les données importées sont consultées en rejeu.",
+      experimentActive
+        ? "Une expérience est en cours ; l’import sera disponible à sa fin."
+        : anyLive
+          ? "Arrêtez la session active pour importer un enregistrement."
+          : "Adaptateur ARGOS disponible. Les données importées sont consultées en rejeu.",
     );
   }
   const hasSamples = !!state.detail?.samples?.length;
@@ -185,6 +212,7 @@ function renderControls() {
   $("replay-cursor").disabled = !hasSamples;
   $("live-button").disabled = !hasSamples;
   renderInvestigationControls();
+  renderExperimentControls();
 }
 function renderSessions() {
   text("session-count", state.sessions.length);
@@ -244,6 +272,7 @@ async function selectSession(id) {
   $("empty-state").hidden = true;
   clearError();
   renderSessions();
+  renderExperiments();
   await Promise.all([
     refreshSelection(),
     loadInvestigations(id, state.investigationSessionRevision, true),
@@ -792,6 +821,7 @@ $("stop-button").addEventListener("click", () =>
     await post(sessionPath("/stop"));
     await refreshSelection();
     await loadSessions();
+    await refreshExperiments();
   }),
 );
 $("dropout-button").addEventListener("click", () =>
@@ -918,12 +948,15 @@ $("import-file").addEventListener("change", () =>
 );
 async function initialize() {
   try {
-    const [health, sessions] = await Promise.all([
+    const [health, sessions, experiments] = await Promise.all([
       api("/api/health"),
       api("/api/sessions"),
+      api("/api/experiments"),
     ]);
     state.health = health;
     state.sessions = sessions;
+    state.experiments = experiments;
+    state.experimentsLoaded = true;
     text("version", health.version);
     if (health.mavlink?.available) {
       $("listen-host").value = health.mavlink.listen_host ?? "127.0.0.1";
@@ -936,6 +969,7 @@ async function initialize() {
           "L’adaptateur ARGOS n’est pas configuré sur ce service.",
       );
     renderSessions();
+    renderExperiments();
     if (sessions.length)
       await selectSession(
         sessions.find((session) => session.status === "live")?.id ??
@@ -991,6 +1025,7 @@ function renderInvestigationControls() {
     "investigation-window-label",
     `Fenêtre demandée : ${start} → ${end}. Le rapport conservera un instantané fixe.`,
   );
+  renderExperimentControls();
 }
 function renderInvestigationHistory() {
   const placeholder = element(
@@ -1341,3 +1376,518 @@ $("investigation-export").addEventListener("click", () => {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   });
 });
+
+function activeExperiment() {
+  return (
+    state.experiments.find((experiment) => experiment.status === "running") ??
+    null
+  );
+}
+function experimentPath(id, suffix = "") {
+  return `/api/experiments/${encodeURIComponent(id)}${suffix}`;
+}
+function experimentStatusLabel(status) {
+  return (
+    {
+      proposed: "Protocole prêt · lancement à confirmer",
+      running: "Acquisitions en cours",
+      completed: "Expérience terminée",
+      cancelled: "Expérience annulée",
+      interrupted: "Expérience interrompue",
+      failed: "Expérience échouée",
+      expired: "Proposition expirée",
+    }[status] ?? status
+  );
+}
+function relatedExperiments() {
+  return state.experiments.filter((experiment) =>
+    [
+      experiment.origin_session_id,
+      experiment.control_session_id,
+      experiment.perturbed_session_id,
+    ].includes(state.id),
+  );
+}
+function selectedExperiment() {
+  return (
+    relatedExperiments().find(
+      (experiment) => experiment.id === state.experimentId,
+    ) ?? null
+  );
+}
+function renderExperimentControls() {
+  const report = state.report;
+  const synthetic = report?.snapshot?.source === "simulation";
+  const pending = [
+    "experiment-prepare",
+    "experiment-start",
+    "experiment-cancel",
+  ].some((key) => state.busy.has(key));
+  const active = activeExperiment();
+  const experiment = selectedExperiment();
+  const anyLive = state.sessions.some((session) => session.status === "live");
+  $("experiment-prepare").disabled =
+    !synthetic || state.investigationLoading || pending;
+  text(
+    "experiment-availability",
+    !report
+      ? "Choisissez un rapport d’investigation pour préparer un essai."
+      : synthetic
+        ? "À partir du rapport sélectionné : préparer deux acquisitions synthétiques pour tester l’effet d’une interruption contrôlée."
+        : "Ce protocole est disponible pour les rapports de sessions synthétiques.",
+  );
+  $("experiment-history").disabled = !relatedExperiments().length || pending;
+  $("experiment-export").disabled =
+    !experiment ||
+    ["proposed", "running"].includes(experiment.status) ||
+    state.busy.has("experiment-export");
+  $("experiment-export").title = ["proposed", "running"].includes(
+    experiment?.status,
+  )
+    ? "L’export est disponible après la fin ou l’annulation de l’expérience."
+    : "Télécharger le protocole, les références de capture et le résultat conservé.";
+  $("experiment-start").hidden = experiment?.status !== "proposed";
+  $("experiment-start").disabled =
+    !experiment ||
+    !!active ||
+    anyLive ||
+    pending ||
+    experiment.expires_at <= Date.now() / 1000;
+  $("experiment-cancel").hidden = !["proposed", "running"].includes(
+    experiment?.status,
+  );
+  $("experiment-cancel").disabled = pending;
+  $("experiment-cancel").textContent =
+    experiment?.status === "proposed"
+      ? "Abandonner ce protocole"
+      : "Annuler l’expérience";
+  text(
+    "experiment-start-help",
+    experiment?.status !== "proposed"
+      ? ""
+      : experiment.expires_at <= Date.now() / 1000
+        ? "La proposition a expiré. Préparez un nouveau protocole depuis le rapport."
+        : active
+          ? "Une expérience est déjà en cours. Attendez sa fin ou annulez-la."
+          : anyLive
+            ? "Arrêtez la session active avant de lancer ces deux acquisitions."
+            : "Le lancement crée deux sessions successives. Vous pouvez annuler à tout moment ; les données déjà reçues restent conservées.",
+  );
+  $("active-experiment").hidden = !active;
+  $("active-experiment-cancel").disabled = pending;
+  if (active) {
+    const elapsed =
+      active.started_at == null
+        ? null
+        : Math.max(0, Date.now() / 1000 - active.started_at);
+    text(
+      "active-experiment-state",
+      state.experimentsFailed
+        ? "Suivi indisponible · état de l’expérience à vérifier après reconnexion."
+        : `${active.perturbed_session_id ? "2 / 2 · Acquisition avec interruption" : "1 / 2 · Acquisition témoin"} · ${seconds(elapsed)} écoulées · limite ${seconds(active.plan.max_wall_duration_s)}.`,
+    );
+  }
+}
+function renderExperiments() {
+  const related = relatedExperiments();
+  if (!related.some((experiment) => experiment.id === state.experimentId))
+    state.experimentId = related[0]?.id ?? null;
+  const experiment = selectedExperiment();
+  const historyKey = JSON.stringify([
+    state.id,
+    related.map((item) => [item.id, item.status]),
+  ]);
+  if (historyKey !== state.experimentsHistoryRendered) {
+    const placeholder = element(
+      "option",
+      "",
+      related.length ? "Choisir une expérience" : "Aucune expérience",
+    );
+    placeholder.value = "";
+    $("experiment-history").replaceChildren(
+      placeholder,
+      ...related.map((item) => {
+        const option = element(
+          "option",
+          "",
+          `${formatDate(item.created_at)} · ${experimentStatusLabel(item.status)}`,
+        );
+        option.value = item.id;
+        return option;
+      }),
+    );
+    state.experimentsHistoryRendered = historyKey;
+  }
+  $("experiment-history").value = experiment?.id ?? "";
+  $("experiment-detail").hidden = !experiment;
+  if (!state.experimentsFailed) {
+    text(
+      "experiment-status",
+      experiment
+        ? `${experimentStatusLabel(experiment.status)}.${experiment.error ? ` ${experiment.error}` : ""}${["interrupted", "failed", "cancelled"].includes(experiment.status) ? " Les acquisitions conservées restent consultables. Aucun redémarrage automatique." : ""}`
+        : "Aucune expérience préparée pour cette session.",
+    );
+    $("experiment-status").classList.remove("is-error");
+  }
+  renderExperimentControls();
+  const renderKey = JSON.stringify(experiment);
+  if (!experiment || renderKey === state.experimentRendered) return;
+  state.experimentRendered = renderKey;
+  const plan = experiment.plan;
+  text("experiment-state", experimentStatusLabel(experiment.status));
+  text("experiment-version", plan.version);
+  text(
+    "experiment-plan-description",
+    `Source synthétique à ${number(plan.sample_rate_hz, 0)} Hz nominaux, ${seconds(plan.phase_duration_s)} par acquisition. L’essai vérifie la réception de ce générateur ; il ne reproduit pas une panne de véhicule.`,
+  );
+  $("experiment-phases").replaceChildren(
+    element(
+      "li",
+      "",
+      `Témoin : ${seconds(plan.phase_duration_s)} de réception sans intervention.`,
+    ),
+    element(
+      "li",
+      "",
+      `Avec interruption : coupure de ${seconds(plan.dropout_duration_s)} demandée à ${seconds(plan.dropout_at_s)}, puis reprise du flux.`,
+    ),
+    element(
+      "li",
+      "",
+      `Comparer les intervalles au seuil de ${seconds(plan.gap_threshold_s)}, avec une tolérance temporelle de ${seconds(plan.timing_tolerance_s)}. Arrêt au plus tard après ${seconds(plan.max_wall_duration_s)}.`,
+    ),
+  );
+  text(
+    "experiment-expiry",
+    experiment.status === "proposed"
+      ? `Proposition valable jusqu’au ${formatDate(experiment.expires_at)}. Aucune acquisition n’a encore été lancée.`
+      : `Lancement : ${formatDate(experiment.started_at)} · fin : ${formatDate(experiment.ended_at)}.`,
+  );
+  const sessionLinks = [];
+  for (const [id, label] of [
+    [experiment.control_session_id, "Ouvrir l’acquisition témoin"],
+    [experiment.perturbed_session_id, "Ouvrir l’acquisition avec interruption"],
+  ]) {
+    if (!id) continue;
+    const button = element("button", "report-evidence-link", label);
+    button.type = "button";
+    button.addEventListener("click", () =>
+      navigateExperimentSession(experiment, id),
+    );
+    sessionLinks.push(button);
+  }
+  $("experiment-session-links").replaceChildren(...sessionLinks);
+  const metadata = [
+    ["Expérience", experiment.id],
+    ["Session d’origine", experiment.origin_session_id],
+    ["Rapport d’origine", experiment.investigation_id],
+    ["Préparée le", formatDate(experiment.created_at)],
+    ["Lancée le", formatDate(experiment.started_at)],
+    ["Terminée le", formatDate(experiment.ended_at)],
+  ];
+  if (experiment.result?.reference?.snapshot_sha256)
+    metadata.push([
+      "Empreinte des données de référence",
+      experiment.result.reference.snapshot_sha256,
+    ]);
+  $("experiment-metadata").replaceChildren(
+    ...metadata.flatMap(([label, value]) => [
+      element("dt", "", label),
+      element("dd", "", value),
+    ]),
+  );
+  text("experiment-plan", JSON.stringify(plan, null, 2));
+  renderExperimentResult(experiment);
+}
+function renderExperimentResult(experiment) {
+  const result = experiment.result;
+  $("experiment-result").hidden = !result;
+  if (!result) return;
+  text(
+    "experiment-outcome",
+    {
+      supported: "Effet de l’intervention observé",
+      not_reproduced: "Effet attendu non reproduit",
+      inconclusive: "Essai non concluant",
+    }[result.outcome] ?? "Comparaison enregistrée",
+  );
+  text("experiment-result-title", result.summary);
+  const { reference, control, perturbed } = result;
+  const maximumGap = (phase) =>
+    phase?.gaps?.length
+      ? Math.max(...phase.gaps.map((gap) => gap.duration_s))
+      : 0;
+  const rows = [
+    [
+      "Échantillons",
+      number(reference?.sample_count, 0),
+      number(control?.sample_count, 0),
+      number(perturbed?.sample_count, 0),
+    ],
+    [
+      "Intervalle médian",
+      seconds(reference?.median_interval_s),
+      seconds(control?.median_interval_s),
+      seconds(perturbed?.median_interval_s),
+    ],
+    [
+      "Intervalle maximal",
+      seconds(reference?.max_interval_s),
+      seconds(control?.max_interval_s),
+      seconds(perturbed?.max_interval_s),
+    ],
+    [
+      `Intervalles > ${seconds(experiment.plan.gap_threshold_s)}`,
+      number(reference?.gap_count, 0),
+      number(control?.gap_count, 0),
+      number(perturbed?.gap_count, 0),
+    ],
+    [
+      "Plus grand intervalle au-dessus du seuil",
+      seconds(reference?.max_gap_s),
+      seconds(maximumGap(control)),
+      seconds(maximumGap(perturbed)),
+    ],
+  ];
+  $("experiment-comparison").replaceChildren(
+    ...rows.map(([label, ...values]) => {
+      const row = element("tr");
+      const heading = element("th", "", label);
+      heading.scope = "row";
+      row.append(heading, ...values.map((value) => element("td", "", value)));
+      return row;
+    }),
+  );
+  text(
+    "experiment-difference",
+    `Référence : fenêtre ${seconds(reference?.window_s?.start_s)} → ${seconds(reference?.window_s?.end_s)}. Écart d’intervalle maximal entre acquisitions : ${seconds(result.difference?.max_interval_s)}. ${number(result.difference?.gap_count, 0)} intervalle(s) supplémentaire(s) au-dessus du seuil.`,
+  );
+  $("experiment-checks").replaceChildren(
+    ...(result.checks ?? []).map((check) => {
+      const row = element(
+        "li",
+        check.passed === true ? "check-passed" : "check-unmet",
+      );
+      row.append(
+        element(
+          "span",
+          "check-status",
+          check.passed === true
+            ? "Vérifié"
+            : check.passed === false
+              ? "Non vérifié"
+              : "Indéterminé",
+        ),
+        element("span", "", check.explanation),
+      );
+      return row;
+    }),
+  );
+  const passedChecks = (result.checks ?? []).filter(
+    (check) => check.passed === true,
+  ).length;
+  text(
+    "experiment-checks-title",
+    `Critères de l’essai · ${passedChecks} / ${result.checks?.length ?? 0} vérifiés`,
+  );
+  $("experiment-checks-title").parentElement.open =
+    result.outcome !== "supported";
+  $("experiment-limitations").replaceChildren(
+    ...(result.limitations ?? []).map((limit) => element("li", "", limit)),
+  );
+  const gap = result.intervention?.gap;
+  $("experiment-gap").hidden = !gap;
+  if (gap)
+    text(
+      "experiment-gap",
+      `Inspecter l’intervalle : ${seconds(gap.start_s)} → ${seconds(gap.end_s)} · échantillons #${gap.before_seq} → #${gap.after_seq}`,
+    );
+}
+async function refreshExperiments() {
+  if (state.experimentsInFlight) return;
+  const revision = state.experimentRevision;
+  state.experimentsInFlight = true;
+  try {
+    const experiments = await api("/api/experiments");
+    if (revision !== state.experimentRevision) return;
+    const prior = state.experiments;
+    state.experiments = experiments;
+    state.experimentsLoaded = true;
+    state.experimentsFailed = false;
+    renderExperiments();
+    renderControls();
+    const changed =
+      JSON.stringify(
+        prior.map((item) => [
+          item.id,
+          item.status,
+          item.control_session_id,
+          item.perturbed_session_id,
+        ]),
+      ) !==
+      JSON.stringify(
+        experiments.map((item) => [
+          item.id,
+          item.status,
+          item.control_session_id,
+          item.perturbed_session_id,
+        ]),
+      );
+    if (changed) await loadSessions();
+  } catch (error) {
+    if (revision !== state.experimentRevision) return;
+    state.experimentsFailed = true;
+    text(
+      "experiment-status",
+      "Le suivi des expériences n’est plus actualisé. Le service reste responsable de leur arrêt borné ; le suivi reprendra à la reconnexion.",
+    );
+    $("experiment-status").classList.add("is-error");
+    if (activeExperiment())
+      text(
+        "active-experiment-state",
+        "Suivi indisponible · état de l’expérience à vérifier après reconnexion.",
+      );
+  } finally {
+    state.experimentsInFlight = false;
+  }
+}
+function retainExperiment(experiment) {
+  state.experimentRevision += 1;
+  state.experiments = [
+    experiment,
+    ...state.experiments.filter((item) => item.id !== experiment.id),
+  ];
+  state.experimentsFailed = false;
+  renderExperiments();
+  renderControls();
+}
+async function navigateExperimentSession(
+  experiment,
+  sessionId,
+  window = null,
+  report = false,
+) {
+  const selection = selectSession(sessionId);
+  const revision = state.investigationSessionRevision;
+  await selection;
+  if (revision !== state.investigationSessionRevision) return;
+  state.experimentId = experiment.id;
+  renderExperiments();
+  if (window) await setWindow(window.start_s, window.end_s);
+  if (revision !== state.investigationSessionRevision) return;
+  if (report) await selectInvestigation(experiment.investigation_id);
+  if (revision !== state.investigationSessionRevision) return;
+  (report ? $("investigation-title") : $("signal-title")).scrollIntoView({
+    block: "start",
+    behavior: "auto",
+  });
+}
+$("experiment-history").addEventListener("change", () => {
+  state.experimentId = $("experiment-history").value;
+  renderExperiments();
+});
+$("experiment-prepare").addEventListener("click", () => {
+  const report = state.report;
+  if (!report || report.snapshot.source !== "simulation") return;
+  const revision = state.investigationSessionRevision;
+  action("experiment-prepare", async () => {
+    const experiment = await post(
+      sessionPath(
+        `/investigations/${encodeURIComponent(report.id)}/experiments`,
+        report.session_id,
+      ),
+    );
+    if (revision === state.investigationSessionRevision)
+      state.experimentId = experiment.id;
+    retainExperiment(experiment);
+    notify(
+      "Protocole enregistré. Consultez les deux acquisitions prévues avant de les lancer.",
+    );
+    if (revision === state.investigationSessionRevision)
+      $("experiment-detail").scrollIntoView({
+        block: "nearest",
+        behavior: "auto",
+      });
+  });
+});
+$("experiment-start").addEventListener("click", () => {
+  const experiment = selectedExperiment();
+  if (!experiment) return;
+  action("experiment-start", async () => {
+    retainExperiment(await post(experimentPath(experiment.id, "/start")));
+    await loadSessions();
+    notify(
+      "Expérience lancée : acquisition témoin, puis acquisition avec interruption. L’annulation reste accessible en haut de page.",
+    );
+  });
+});
+function cancelExperiment(experiment) {
+  if (!experiment) return;
+  action("experiment-cancel", async () => {
+    const stopped = await post(experimentPath(experiment.id, "/cancel"));
+    retainExperiment(stopped);
+    await loadSessions();
+    await refreshSelection();
+    notify(
+      stopped.status === "cancelled"
+        ? "Expérience annulée. Les données déjà reçues restent conservées."
+        : `${experimentStatusLabel(stopped.status)}. L’état enregistré a été actualisé.`,
+    );
+  });
+}
+$("experiment-cancel").addEventListener("click", () =>
+  cancelExperiment(selectedExperiment()),
+);
+$("active-experiment-cancel").addEventListener("click", () =>
+  cancelExperiment(activeExperiment()),
+);
+$("active-experiment-open").addEventListener("click", async () => {
+  const experiment = activeExperiment();
+  if (!experiment) return;
+  await navigateExperimentSession(experiment, experiment.origin_session_id);
+  if (state.id === experiment.origin_session_id)
+    $("comparison-title").scrollIntoView({ block: "start", behavior: "auto" });
+});
+$("experiment-origin").addEventListener("click", () => {
+  const experiment = selectedExperiment();
+  if (experiment)
+    navigateExperimentSession(
+      experiment,
+      experiment.origin_session_id,
+      null,
+      true,
+    );
+});
+$("experiment-gap").addEventListener("click", () => {
+  const experiment = selectedExperiment();
+  const gap = experiment?.result?.intervention?.gap;
+  if (gap)
+    navigateExperimentSession(experiment, experiment.perturbed_session_id, gap);
+});
+$("experiment-export").addEventListener("click", () => {
+  const experiment = selectedExperiment();
+  if (!experiment) return;
+  action("experiment-export", async () => {
+    const data = await api(experimentPath(experiment.id, "/export"));
+    const url = URL.createObjectURL(
+      new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
+    );
+    const link = element("a");
+    link.href = url;
+    link.download = `argos-studio-experiment-${experiment.id}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+});
+let experimentPolls = 0;
+setInterval(() => {
+  renderExperimentControls();
+  if (
+    activeExperiment() ||
+    state.experimentsFailed ||
+    ++experimentPolls % 5 === 0
+  )
+    refreshExperiments();
+}, 1000);

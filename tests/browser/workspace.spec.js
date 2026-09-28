@@ -522,3 +522,242 @@ test("late investigation responses cannot replace another window or session sele
     await page.unroute(reportUrl);
   }
 });
+
+async function prepareExperimentReference(page, name) {
+  const created = await page.request.post("/api/sessions", {
+    data: {
+      name,
+      objective:
+        "Vérifier un effet de réception sur deux acquisitions synthétiques.",
+    },
+  });
+  expect(created.status()).toBe(201);
+  const session = await created.json();
+  await expect
+    .poll(async () => {
+      const detail = await (
+        await page.request.get(`/api/sessions/${session.id}`)
+      ).json();
+      return detail.session.sample_count;
+    })
+    .toBeGreaterThan(4);
+  await page.request.post(`/api/sessions/${session.id}/stop`, { data: {} });
+  const investigated = await page.request.post(
+    `/api/sessions/${session.id}/investigations`,
+    { data: {} },
+  );
+  expect(investigated.status()).toBe(201);
+  return { session, report: await investigated.json() };
+}
+
+test("an explicit synthetic experiment preserves both captures and links its comparison to the reference", async ({
+  page,
+}) => {
+  test.setTimeout(45_000);
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const { session, report } = await prepareExperimentReference(
+    page,
+    "Référence de l’essai comparatif",
+  );
+  let experiment;
+  try {
+    await page.goto("/");
+    await expect(page.locator("#investigation-history")).toHaveValue(report.id);
+    await expect(page.locator("#experiment-prepare")).toBeEnabled();
+    const [prepared] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response.url().endsWith(`/investigations/${report.id}/experiments`) &&
+          response.request().method() === "POST",
+      ),
+      page.locator("#experiment-prepare").click(),
+    ]);
+    expect(prepared.status()).toBe(201);
+    experiment = await prepared.json();
+    expect(experiment.status).toBe("proposed");
+    expect(experiment.control_session_id).toBeNull();
+    await expect(page.locator("#experiment-state")).toHaveText(
+      "Protocole prêt · lancement à confirmer",
+    );
+    await expect(page.locator("#experiment-phases")).toContainText("Témoin");
+    await expect(page.locator("#experiment-phases")).toContainText("20,00 s");
+    await expect(page.locator("#active-experiment")).toBeHidden();
+    await expect(page.locator("#experiment-start")).toBeEnabled();
+    await page.locator("#experiment-start").click();
+    await expect(page.locator("#active-experiment")).toBeVisible();
+    await expect(page.locator("#active-experiment-state")).toContainText(
+      "1 / 2",
+    );
+    await expect(page.locator("#start-button")).toBeDisabled();
+    await expect(page.locator("#experiment-session-links button")).toHaveCount(
+      1,
+    );
+    await page.locator("#experiment-session-links button").first().click();
+    await expect(page.locator("#active-session-title")).toContainText("Témoin");
+    await expect(page.locator("#dropout-button")).toBeDisabled();
+    await expect(page.locator("#stop-button")).toHaveText(
+      "Annuler l’expérience",
+    );
+    await page.locator("#active-experiment-open").click();
+    await expect(page.locator("#active-session-title")).toHaveText(
+      session.name,
+    );
+    await expect(page.locator("#active-experiment-state")).toContainText(
+      "2 / 2",
+      { timeout: 9000 },
+    );
+    await expect(page.locator("#experiment-session-links button")).toHaveCount(
+      2,
+    );
+    await expect(page.locator("#experiment-state")).toHaveText(
+      "Expérience terminée",
+      { timeout: 14000 },
+    );
+    await expect(page.locator("#active-experiment")).toBeHidden();
+    await expect(page.locator("#start-button")).toBeEnabled();
+    await expect(page.locator("#experiment-outcome")).toHaveText(
+      "Effet de l’intervention observé",
+    );
+    await expect(page.locator("#experiment-checks .check-unmet")).toHaveCount(
+      0,
+    );
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.locator("#experiment-export").click(),
+    ]);
+    const exported = JSON.parse(await readFile(await download.path(), "utf8"));
+    expect(exported.id).toBe(experiment.id);
+    expect(exported.status).toBe("completed");
+    expect(exported.result.outcome).toBe("supported");
+    expect(exported.result.reference.report_id).toBe(report.id);
+    expect(exported.result.reference.snapshot_sha256).toBe(
+      report.snapshot.sha256,
+    );
+    expect(exported.result.control.gap_count).toBe(0);
+    expect(exported.result.perturbed.gap_count).toBe(1);
+    await page.locator("#experiment-gap").click();
+    await expect(page.locator("#active-session-title")).toContainText(
+      "Interruption",
+    );
+    const gap = exported.result.intervention.gap;
+    await expect(page.locator("#window-start")).toHaveValue(
+      String(gap.start_s),
+    );
+    await expect(page.locator("#window-end")).toHaveValue(String(gap.end_s));
+    await expect(page.locator("#experiment-history")).toHaveValue(
+      experiment.id,
+    );
+    await page.reload();
+    await expect(page.locator("#experiment-history")).toHaveValue(
+      experiment.id,
+    );
+    await expect(page.locator("#experiment-outcome")).toHaveText(
+      "Effet de l’intervention observé",
+    );
+    await page.locator("#experiment-origin").click();
+    await expect(page.locator("#active-session-title")).toHaveText(
+      session.name,
+    );
+    await expect(page.locator("#investigation-history")).toHaveValue(report.id);
+    await page
+      .locator(".comparison-panel")
+      .screenshot({ path: "test-results/experiment-desktop.png" });
+    await page.setViewportSize({ width: 390, height: 844 });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(390);
+    await page
+      .locator(".comparison-panel")
+      .screenshot({ path: "test-results/experiment-mobile.png" });
+    expect(errors).toEqual([]);
+  } finally {
+    if (experiment)
+      await page.request.post(`/api/experiments/${experiment.id}/cancel`, {
+        data: {},
+      });
+  }
+});
+
+test("experiment cancellation remains available after navigation and reload without restarting the protocol", async ({
+  page,
+}) => {
+  const { session, report } = await prepareExperimentReference(
+    page,
+    "Référence de l’essai annulé",
+  );
+  let experiment;
+  try {
+    await page.goto("/");
+    await expect(page.locator("#investigation-history")).toHaveValue(report.id);
+    const [prepared] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response.url().endsWith(`/investigations/${report.id}/experiments`) &&
+          response.request().method() === "POST",
+      ),
+      page.locator("#experiment-prepare").click(),
+    ]);
+    experiment = await prepared.json();
+    await page.locator("#experiment-start").click();
+    await expect(page.locator("#active-experiment")).toBeVisible();
+    await page.reload();
+    await expect(page.locator("#active-experiment")).toBeVisible();
+    await expect(page.locator("#active-experiment-cancel")).toBeEnabled();
+    const sessions = await (await page.request.get("/api/sessions")).json();
+    const unrelated = sessions.find(
+      (item) => item.id !== session.id && item.status !== "live",
+    );
+    expect(unrelated).toBeDefined();
+    await page
+      .locator(".session-item")
+      .filter({ hasText: unrelated.name })
+      .click();
+    await expect(page.locator("#active-experiment")).toBeVisible();
+    await page.locator("#active-experiment-cancel").click();
+    await expect(page.locator("#active-experiment")).toBeHidden();
+    const stopped = await (
+      await page.request.get(`/api/experiments/${experiment.id}`)
+    ).json();
+    expect(stopped.status).toBe("cancelled");
+    expect(stopped.perturbed_session_id).toBeNull();
+    const capture = await (
+      await page.request.get(`/api/sessions/${stopped.control_session_id}`)
+    ).json();
+    expect(capture.session.status).toBe("interrupted");
+    await page
+      .locator(".session-item")
+      .filter({ hasText: session.name })
+      .click();
+    await expect(page.locator("#experiment-state")).toHaveText(
+      "Expérience annulée",
+    );
+    await expect(page.locator("#experiment-start")).toBeHidden();
+    await expect(page.locator("#experiment-status")).toContainText(
+      "Aucun redémarrage automatique",
+    );
+    await page.reload();
+    await page
+      .locator(".session-item")
+      .filter({ hasText: session.name })
+      .click();
+    await expect(page.locator("#experiment-history")).toHaveValue(
+      experiment.id,
+    );
+    await expect(page.locator("#experiment-state")).toHaveText(
+      "Expérience annulée",
+    );
+    await expect(page.locator("#active-experiment")).toBeHidden();
+    await expect(page.locator("#start-button")).toBeEnabled();
+    const recovered = await (
+      await page.request.get(`/api/experiments/${experiment.id}`)
+    ).json();
+    expect(recovered.perturbed_session_id).toBeNull();
+    expect(recovered.result).toBeNull();
+  } finally {
+    if (experiment)
+      await page.request.post(`/api/experiments/${experiment.id}/cancel`, {
+        data: {},
+      });
+  }
+});

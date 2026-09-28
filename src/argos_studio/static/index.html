@@ -63,6 +63,32 @@
           role="status"
           hidden
         ></div>
+        <section
+          id="active-experiment"
+          class="active-experiment"
+          aria-label="Expérience en cours"
+          hidden
+        >
+          <div>
+            <p class="eyebrow">ESSAI SYNTHÉTIQUE EN COURS</p>
+            <p id="active-experiment-state" role="status"></p>
+          </div>
+          <div class="experiment-actions">
+            <button
+              id="active-experiment-open"
+              class="button subtle"
+              type="button"
+            >
+              Voir le protocole</button
+            ><button
+              id="active-experiment-cancel"
+              class="button danger"
+              type="button"
+            >
+              Annuler l’expérience
+            </button>
+          </div>
+        </section>
         <section class="start-panel" aria-labelledby="start-title">
           <div class="start-description">
             <h2 id="start-title">Nouvelle session</h2>
@@ -604,6 +630,146 @@
                 <summary>Calculs exécutés et empreinte des données</summary>
                 <p id="report-fingerprint"></p>
                 <div id="report-tools"></div>
+              </details>
+            </article>
+          </section>
+          <section
+            class="panel comparison-panel"
+            aria-labelledby="comparison-title"
+          >
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">HYPOTHÈSE · ESSAI · COMPARAISON</p>
+                <h3 id="comparison-title">Vérifier par un essai synthétique</h3>
+              </div>
+              <span class="investigation-method"
+                >Deux acquisitions conservées · sans matériel</span
+              >
+            </div>
+            <div class="experiment-prepare-row">
+              <p id="experiment-availability" class="small muted">
+                Choisissez un rapport synthétique pour préparer un essai.
+              </p>
+              <button
+                id="experiment-prepare"
+                class="button subtle"
+                type="button"
+                disabled
+              >
+                Préparer le protocole
+              </button>
+            </div>
+            <div class="experiment-history-row">
+              <label for="experiment-history"
+                >Expériences liées à cette session<select
+                  id="experiment-history"
+                  disabled
+                >
+                  <option value="">Aucune expérience</option>
+                </select></label
+              ><button
+                id="experiment-export"
+                class="button subtle"
+                type="button"
+                disabled
+              >
+                Exporter l’expérience
+              </button>
+            </div>
+            <p
+              id="experiment-status"
+              class="investigation-status"
+              role="status"
+            >
+              Aucune expérience préparée pour cette session.
+            </p>
+            <article id="experiment-detail" class="experiment-detail" hidden>
+              <div class="report-heading">
+                <div>
+                  <p id="experiment-state" class="eyebrow"></p>
+                  <h4>
+                    Comparer une réception témoin à une interruption de 2 s
+                  </h4>
+                </div>
+                <span id="experiment-version" class="count"></span>
+              </div>
+              <p id="experiment-plan-description" class="small muted"></p>
+              <ol id="experiment-phases" class="experiment-phases"></ol>
+              <p id="experiment-expiry" class="small muted"></p>
+              <div class="experiment-actions">
+                <button
+                  id="experiment-start"
+                  class="button primary"
+                  type="button"
+                >
+                  Lancer les deux acquisitions</button
+                ><button
+                  id="experiment-cancel"
+                  class="button danger"
+                  type="button"
+                >
+                  Annuler l’expérience</button
+                ><button
+                  id="experiment-origin"
+                  class="text-button"
+                  type="button"
+                >
+                  Ouvrir le rapport d’origine
+                </button>
+              </div>
+              <p id="experiment-start-help" class="small muted"></p>
+              <div
+                id="experiment-session-links"
+                class="experiment-session-links"
+              ></div>
+              <section
+                id="experiment-result"
+                class="experiment-result"
+                aria-labelledby="experiment-result-title"
+                hidden
+              >
+                <p id="experiment-outcome" class="eyebrow"></p>
+                <h4 id="experiment-result-title"></h4>
+                <div class="comparison-table-wrap">
+                  <table class="comparison-table">
+                    <caption>
+                      Mesures de réception conservées
+                    </caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Mesure</th>
+                        <th scope="col">Référence</th>
+                        <th scope="col">Témoin</th>
+                        <th scope="col">Avec interruption</th>
+                      </tr>
+                    </thead>
+                    <tbody id="experiment-comparison"></tbody>
+                  </table>
+                </div>
+                <p id="experiment-difference" class="small muted"></p>
+                <button
+                  id="experiment-gap"
+                  class="report-evidence-link"
+                  type="button"
+                  hidden
+                >
+                  Inspecter l’intervalle observé
+                </button>
+                <details class="experiment-criteria">
+                  <summary id="experiment-checks-title">
+                    Critères de l’essai
+                  </summary>
+                  <ul id="experiment-checks" class="experiment-checks"></ul>
+                </details>
+                <details class="report-limits">
+                  <summary>Portée de la comparaison</summary>
+                  <ul id="experiment-limitations"></ul>
+                </details>
+              </section>
+              <details class="experiment-record">
+                <summary>Protocole et traçabilité</summary>
+                <dl id="experiment-metadata"></dl>
+                <pre id="experiment-plan" class="evidence-data"></pre>
               </details>
             </article>
           </section>

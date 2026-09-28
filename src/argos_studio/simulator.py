@@ -36,27 +36,36 @@ class Simulator:
     def elapsed(self) -> float:
         return min(max(0.0, time.monotonic() - self.started), self.max_duration_s)
 
-    async def start(self, name: str, objective: str) -> dict:
+    async def start(
+        self,
+        name: str,
+        objective: str,
+        *,
+        experiment_id: str | None = None,
+        experiment_role: str | None = None,
+    ) -> dict:
         async with self.lock:
             if self.active:
                 raise ValueError("Une session de simulation est déjà en cours.")
-            session = self.store.create_session(
-                name,
-                objective,
-                metadata={
-                    "environment": "simulation",
-                    "generator": "attitude-sine-v1",
-                    "vehicle": "Synthetic attitude source / 01",
-                    "sample_rate_hz": 1 / self.period_s,
-                    "received_at_clock": "utc_epoch",
-                    "source_time_clock": "simulator_elapsed",
-                    "elapsed_clock": "host_monotonic",
-                    "max_duration_s": self.max_duration_s,
-                    "description": (
-                        "Deterministic synthetic angles; not a flight dynamics simulator."
-                    ),
-                },
-            )
+            metadata = {
+                "environment": "simulation",
+                "generator": "attitude-sine-v1",
+                "vehicle": "Synthetic attitude source / 01",
+                "sample_rate_hz": 1 / self.period_s,
+                "received_at_clock": "utc_epoch",
+                "source_time_clock": "simulator_elapsed",
+                "elapsed_clock": "host_monotonic",
+                "max_duration_s": self.max_duration_s,
+                "description": ("Deterministic synthetic angles; not a flight dynamics simulator."),
+            }
+            if experiment_id is not None:
+                session = self.store.create_experiment_session(
+                    experiment_id, experiment_role, name, objective, metadata
+                )
+            else:
+                if experiment_role is not None:
+                    raise ValueError("An experiment role requires an experiment ID")
+                session = self.store.create_session(name, objective, metadata=metadata)
             self.session_id = session["id"]
             self.started = time.monotonic()
             self.last_received = None
@@ -131,19 +140,25 @@ class Simulator:
                 return session
             elapsed = self.elapsed()
             self.stop_status = status
-            self.store.add_event(
-                session_id,
-                "source_stopped",
-                "Acquisition arrêtée ; données conservées.",
-                elapsed,
-            )
-            self.task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.task
-            self.pause_until = 0.0
-            # Cancellation can happen before _run enters its try/finally block.
-            elapsed = max(self.elapsed(), self.store.get_session(session_id)["elapsed_s"])
-            return self.store.finish_session(session_id, status=status, elapsed_s=elapsed)
+            try:
+                try:
+                    self.store.add_event(
+                        session_id,
+                        "source_stopped",
+                        "Acquisition arrêtée ; données conservées.",
+                        elapsed,
+                    )
+                finally:
+                    # A journal write failure must not keep the generator running.
+                    self.task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self.task
+            finally:
+                self.pause_until = 0.0
+                # Cancellation can happen before _run enters its try/finally block.
+                elapsed = max(self.elapsed(), self.store.get_session(session_id)["elapsed_s"])
+                stopped = self.store.finish_session(session_id, status=status, elapsed_s=elapsed)
+            return stopped
 
     async def dropout(self, session_id: str) -> dict:
         async with self.lock:

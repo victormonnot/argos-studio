@@ -16,14 +16,23 @@ class Acquisition:
             dropout_duration_s=dropout_duration_s,
         )
         self.receiver = MavlinkReceiver(store, max_duration_s=max_duration_s)
+        self.experiment_source: Simulator | None = None
+
+    @property
+    def sources(self):
+        return tuple(
+            source
+            for source in (self.simulator, self.receiver, self.experiment_source)
+            if source is not None
+        )
 
     @property
     def active(self) -> bool:
-        return self.simulator.active or self.receiver.active
+        return any(source.active for source in self.sources)
 
     @property
     def session_id(self) -> str | None:
-        for source in (self.simulator, self.receiver):
+        for source in self.sources:
             if source.active:
                 return source.session_id
         return None
@@ -53,7 +62,9 @@ class Acquisition:
         raise ValueError("Source non prise en charge.")
 
     def owner(self, session_id: str):
-        return self.receiver if self.receiver.session_id == session_id else self.simulator
+        return next(
+            (source for source in self.sources if source.session_id == session_id), self.simulator
+        )
 
     async def stop(self, session_id: str, *, status: str = "completed") -> dict:
         return await self.owner(session_id).stop(session_id, status=status)

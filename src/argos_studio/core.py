@@ -22,6 +22,10 @@ STATUSES = {"live", "completed", "interrupted"}
 DATAGRAM_DISPOSITIONS = {"accepted", "invalid", "signed", "foreign_source", "foreign_peer"}
 MAX_INVESTIGATIONS = 50
 MAX_INVESTIGATION_BYTES = 4 * 1024 * 1024
+MAX_EXPERIMENTS = 20
+MAX_EXPERIMENT_PLAN_BYTES = 64 * 1024
+MAX_EXPERIMENT_RESULT_BYTES = 4 * 1024 * 1024
+EXPERIMENT_TERMINAL_STATUSES = {"completed", "cancelled", "interrupted", "failed", "expired"}
 SAMPLE_FIELDS = (
     "source_time_s",
     "elapsed_s",
@@ -86,12 +90,16 @@ class Store:
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version > 2:
+        if version > 3:
             raise ValueError(f"Database schema version {version} requires a newer ARGOS Studio")
+        if version == 3:
+            return
         if version == 2:
+            Store._migrate_experiments(connection)
             return
         if version == 1:
             Store._migrate_investigations(connection)
+            Store._migrate_experiments(connection)
             return
         # Build the replacement before dropping the old table. Renaming the old
         # table first would rewrite the foreign keys in samples and events.
@@ -191,6 +199,7 @@ class Store:
         finally:
             connection.execute("PRAGMA foreign_keys=ON")
         Store._migrate_investigations(connection)
+        Store._migrate_experiments(connection)
 
     @staticmethod
     def _migrate_investigations(connection: sqlite3.Connection) -> None:
@@ -207,6 +216,45 @@ class Store:
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise ValueError("Database migration found inconsistent foreign keys")
             connection.execute("PRAGMA user_version=2")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_experiments(connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "CREATE UNIQUE INDEX investigation_identity ON investigations(id,session_id)"
+            )
+            connection.execute(
+                "CREATE TABLE experiments ("
+                "id TEXT PRIMARY KEY, "
+                "origin_session_id TEXT NOT NULL REFERENCES sessions(id), "
+                "investigation_id TEXT NOT NULL, "
+                "status TEXT NOT NULL CHECK(status IN "
+                "('proposed','running','completed','cancelled','interrupted','failed','expired')), "
+                "created_at REAL NOT NULL, expires_at REAL NOT NULL, started_at REAL, "
+                "ended_at REAL, plan TEXT NOT NULL, "
+                "control_session_id TEXT UNIQUE REFERENCES sessions(id), "
+                "perturbed_session_id TEXT UNIQUE REFERENCES sessions(id), "
+                "result TEXT, error TEXT, "
+                "CHECK(control_session_id IS NULL OR perturbed_session_id IS NULL "
+                "OR control_session_id != perturbed_session_id), "
+                "FOREIGN KEY(investigation_id,origin_session_id) REFERENCES "
+                "investigations(id,session_id))"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX one_running_experiment ON experiments((1)) "
+                "WHERE status='running'"
+            )
+            connection.execute(
+                "CREATE INDEX experiment_origin ON experiments(origin_session_id,created_at DESC)"
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ValueError("Database migration found inconsistent foreign keys")
+            connection.execute("PRAGMA user_version=3")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -279,6 +327,14 @@ class Store:
     ) -> dict[str, Any]:
         values = self._session_values(name, objective, source, metadata, status)
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                status == "live"
+                and connection.execute(
+                    "SELECT 1 FROM experiments WHERE status='running'"
+                ).fetchone()
+            ):
+                raise ValueError("The acquisition source is reserved by a running experiment")
             self._insert_session(connection, values)
         return self.get_session(values[0])
 
@@ -415,6 +471,230 @@ class Store:
             result = dict(row)
             report = json.loads(result.pop("report"))
             return {**result, **report}
+
+    @staticmethod
+    def _require_experiment(connection: sqlite3.Connection, experiment_id: str) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM experiments WHERE id=?", (experiment_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown experiment: {experiment_id}")
+        return row
+
+    @staticmethod
+    def _experiment(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["plan"] = json.loads(result["plan"])
+        result["result"] = None if result["result"] is None else json.loads(result["result"])
+        return result
+
+    @staticmethod
+    def _experiment_json(value: Any, name: str, max_bytes: int) -> str:
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} must be an object")
+        # Avoid JSON's implicit conversion of numeric/boolean keys to strings.
+        # Besides losing identity this could overwrite another retained key.
+        pending = [value]
+        visited = set()
+        while pending:
+            item = pending.pop()
+            if not isinstance(item, (dict, list, tuple)) or id(item) in visited:
+                continue
+            visited.add(id(item))
+            if isinstance(item, dict):
+                if any(not isinstance(key, str) for key in item):
+                    raise ValueError(f"{name} must contain only string object keys")
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
+        return _json_object(value, name, max_bytes=max_bytes)
+
+    def create_experiment(
+        self,
+        session_id: str,
+        investigation_id: str,
+        plan: dict[str, Any],
+        ttl_s: float = 600,
+    ) -> dict[str, Any]:
+        """Retain a proposed synthetic check without starting an acquisition."""
+        encoded = self._experiment_json(plan, "plan", MAX_EXPERIMENT_PLAN_BYTES)
+        ttl = _number(ttl_s, "ttl_s", minimum=0)
+        if not 0 < ttl <= 3600:
+            raise ValueError("ttl_s must be greater than zero and at most 3600 seconds")
+        experiment_id = str(uuid4())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = self._require_session(connection, session_id)
+            investigation = connection.execute(
+                "SELECT report FROM investigations WHERE id=? AND session_id=?",
+                (investigation_id, session_id),
+            ).fetchone()
+            if investigation is None:
+                raise KeyError(f"Unknown investigation: {investigation_id}")
+            snapshot = json.loads(investigation["report"]).get("snapshot", {})
+            if session["source"] != "simulation" or snapshot.get("source") != "simulation":
+                raise ValueError("Experiments require a synthetic session and investigation")
+            count = connection.execute(
+                "SELECT COUNT(*) FROM experiments WHERE origin_session_id=?", (session_id,)
+            ).fetchone()[0]
+            if count >= MAX_EXPERIMENTS:
+                raise ValueError(f"A session may contain at most {MAX_EXPERIMENTS} experiments")
+            now = time.time()
+            connection.execute(
+                "INSERT INTO experiments "
+                "(id,origin_session_id,investigation_id,status,created_at,expires_at,plan) "
+                "VALUES (?,?,?,'proposed',?,?,?)",
+                (experiment_id, session_id, investigation_id, now, now + ttl, encoded),
+            )
+            result = self._experiment(self._require_experiment(connection, experiment_id))
+        return result
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            return self._experiment(self._require_experiment(connection, experiment_id))
+
+    def list_experiments(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            if session_id is not None:
+                self._require_session(connection, session_id)
+            rows = connection.execute(
+                "SELECT * FROM experiments "
+                + ("WHERE origin_session_id=? " if session_id is not None else "")
+                + "ORDER BY created_at DESC,id DESC",
+                () if session_id is None else (session_id,),
+            )
+            return [self._experiment(row) for row in rows]
+
+    def claim_experiment(self, experiment_id: str, max_sessions: int = 100) -> dict[str, Any]:
+        """Atomically claim a nonexpired proposal and reserve the synthetic source."""
+        if type(max_sessions) is not int or max_sessions < 2:
+            raise ValueError("max_sessions must be an integer of at least two")
+        expired = False
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            experiment = self._require_experiment(connection, experiment_id)
+            if experiment["status"] != "proposed":
+                raise ValueError("Only a proposed experiment can be started once")
+            now = time.time()
+            if experiment["expires_at"] <= now:
+                connection.execute(
+                    "UPDATE experiments SET status='expired',ended_at=? WHERE id=?",
+                    (now, experiment_id),
+                )
+                expired = True
+            else:
+                if connection.execute(
+                    "SELECT 1 FROM experiments WHERE status='running'"
+                ).fetchone():
+                    raise ValueError("Another experiment is already running")
+                if connection.execute("SELECT 1 FROM sessions WHERE status='live'").fetchone():
+                    raise ValueError("An acquisition session is already live")
+                count = connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+                if count + 2 > max_sessions:
+                    raise ValueError("An experiment requires room for two additional sessions")
+                connection.execute(
+                    "UPDATE experiments SET status='running',started_at=? WHERE id=?",
+                    (now, experiment_id),
+                )
+            result = self._experiment(self._require_experiment(connection, experiment_id))
+        if expired:
+            # Persist expiry before rejecting the request; raising in the
+            # transaction would roll it back into an apparently usable proposal.
+            raise ValueError("The experiment proposal has expired; create a new proposal")
+        return result
+
+    def create_experiment_session(
+        self,
+        experiment_id: str,
+        role: str,
+        name: str,
+        objective: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create and attach one owned capture in the same transaction."""
+        if not isinstance(role, str) or role not in {"control", "perturbed"}:
+            raise ValueError("Experiment role must be control or perturbed")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("metadata must be an object")
+        metadata = {**(metadata or {}), "experiment_id": experiment_id, "experiment_role": role}
+        values = self._session_values(name, objective, "simulation", metadata, "live")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            experiment = self._require_experiment(connection, experiment_id)
+            if experiment["status"] != "running":
+                raise ValueError("An experiment must be running to create its capture")
+            field = f"{role}_session_id"
+            if experiment[field] is not None:
+                raise ValueError(f"The experiment already has a {role} capture")
+            if role == "perturbed":
+                control_id = experiment["control_session_id"]
+                if (
+                    control_id is None
+                    or self._require_session(connection, control_id)["status"] != "completed"
+                ):
+                    raise ValueError(
+                        "The control capture must complete before the perturbed capture"
+                    )
+            self._insert_session(connection, values)
+            connection.execute(
+                f"UPDATE experiments SET {field}=? WHERE id=?", (values[0], experiment_id)
+            )
+        return self.get_session(values[0])
+
+    def finish_experiment(
+        self,
+        experiment_id: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Retain the first terminal outcome; retries never overwrite its proof."""
+        if not isinstance(status, str) or status not in EXPERIMENT_TERMINAL_STATUSES - {"expired"}:
+            raise ValueError("Unsupported terminal experiment status")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            experiment = self._require_experiment(connection, experiment_id)
+            if experiment["status"] in EXPERIMENT_TERMINAL_STATUSES:
+                return self._experiment(experiment)
+            if experiment["status"] == "proposed" and status != "cancelled":
+                raise ValueError("Only a running experiment can finish with this outcome")
+            encoded = (
+                None
+                if result is None
+                else self._experiment_json(result, "result", MAX_EXPERIMENT_RESULT_BYTES)
+            )
+            message = None if error is None else _text(error, "error", 2000, empty=True)
+            if status == "completed":
+                if result is None:
+                    raise ValueError("A completed experiment requires its comparison result")
+                for field in ("control_session_id", "perturbed_session_id"):
+                    session_id = experiment[field]
+                    if (
+                        session_id is None
+                        or self._require_session(connection, session_id)["status"] != "completed"
+                    ):
+                        raise ValueError("Both experiment captures must be completed")
+            connection.execute(
+                "UPDATE experiments SET status=?,ended_at=?,result=?,error=? WHERE id=?",
+                (status, time.time(), encoded, message, experiment_id),
+            )
+            return self._experiment(self._require_experiment(connection, experiment_id))
+
+    def recover_experiments(self) -> int:
+        """Mark abandoned executions as interrupted without resuming their captures."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            running = connection.execute(
+                "UPDATE experiments SET status='interrupted',error=? WHERE status='running'",
+                ("The process ended before the experiment completed; execution was not resumed.",),
+            ).rowcount
+            now = time.time()
+            expired = connection.execute(
+                "UPDATE experiments SET status='expired',ended_at=? "
+                "WHERE status='proposed' AND expires_at<=?",
+                (now, now),
+            ).rowcount
+            return running + expired
 
     def snapshot(
         self,
